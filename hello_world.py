@@ -89,6 +89,11 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, window_size=20, min_avg_spee
                 event = {
                     'start_index': int(start_idx),
                     'end_index': int(end_idx),
+                    'pivot_index': int(k),
+                    'in_start': int(start_idx),
+                    'in_end': int(k),
+                    'out_start': int(k),
+                    'out_end': int(end_idx),
                     'start_time': start_time,
                     'end_time': end_time,
                     'duration_s': duration_s,
@@ -294,22 +299,32 @@ if uploaded_file is not None:
             weight=2
         ).add_to(m)
         
-        # ジャイブ区間を太ラインで描画（成功:緑, 失敗:オレンジ）
+        # ジャイブの進入（赤）/脱出（緑）区間を太線で描画
         failed_end_idxs = set([e['end_index'] for e in jibes_failed])
         for j in jibes:
-            idx_start = j['start_index']
-            idx_end = j['end_index']
             is_failed = j['end_index'] in failed_end_idxs
-            color = 'orange' if is_failed else 'green'
-            folium.PolyLine(
-                locations=[
-                    (df['latitude'].iloc[k], df['longitude'].iloc[k])
-                    for k in range(idx_start, min(idx_end + 1, len(df)))
-                ],
-                color=color,
-                weight=8,
-                opacity=0.8,
-            ).add_to(m)
+
+            # 進入部分（赤）
+            in_start = max(0, j.get('in_start', j['start_index']))
+            in_end = min(len(df) - 1, j.get('in_end', j['start_index']))
+            if in_end > in_start:
+                folium.PolyLine(
+                    locations=[(df['latitude'].iloc[i], df['longitude'].iloc[i]) for i in range(in_start, in_end + 1)],
+                    color='red',
+                    weight=8,
+                    opacity=0.9
+                ).add_to(m)
+
+            # 脱出部分（緑）
+            out_start = max(0, j.get('out_start', j['start_index']))
+            out_end = min(len(df) - 1, j.get('out_end', j['end_index']))
+            if out_end > out_start:
+                folium.PolyLine(
+                    locations=[(df['latitude'].iloc[i], df['longitude'].iloc[i]) for i in range(out_start, out_end + 1)],
+                    color='green',
+                    weight=8,
+                    opacity=0.9
+                ).add_to(m)
 
         # ジャイブ（角度ベース）のマーク（成功:緑, 失敗:オレンジ）
         for j in jibes:
