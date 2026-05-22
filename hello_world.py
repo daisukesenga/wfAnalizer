@@ -17,59 +17,113 @@ st.write("Wing foilセッションを詳細に分析します")
 # ファイルアップロード
 uploaded_file = st.file_uploader("GPXファイルをアップロード", type="gpx")
 
-def detect_jibes(df, speed_threshold=2.0, min_speed_before=3.0, rel_drop=0.4):
-    """ジャイブ失敗を検出（速度が急激に低下した箇所）
+def bearing_between(lat1, lon1, lat2, lon2):
+    """2点間の方位角を度で返す（0-360）"""
+    # ラジアン変換
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dlambda = np.radians(lon2 - lon1)
 
-    改善点:
-    - 速度を短い窓で平滑化してノイズを低減
-    - 絶対的な速度低下（speed_threshold）に加え、
-      事前速度がある程度以上であること（min_speed_before）と
-      相対的な減少率（rel_drop）を満たす場合のみ検出する
+    x = np.sin(dlambda) * np.cos(phi2)
+    y = np.cos(phi1) * np.sin(phi2) - np.sin(phi1) * np.cos(phi2) * np.cos(dlambda)
+    bearing = np.degrees(np.arctan2(x, y))
+    bearing = (bearing + 360) % 360
+    return bearing
+
+
+def angle_diff_signed(a, b):
+    """a->b の符号付き角差を -180..180 の範囲で返す"""
+    diff = (b - a + 180) % 360 - 180
+    return diff
+
+
+def detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0):
+    """トラックの方位変化からジャイブを検出する。
+
+    - ジャイブ: 連続した方位変化の累積が angle_threshold 以上（度）
+    - 失敗ジャイブ: ジャイブの所要時間が duration_threshold 秒以上
+
+    戻り値: (jibes_all, jibes_failed)
+    各要素は dict: start_index,end_index,start_time,end_time,duration_s,angle_deg,direction
     """
+    jibes = []
     jibes_failed = []
 
-    if len(df) > 1:
-        # 短い窓で平滑化してノイズを抑える
-        df['speed_smooth'] = df['speed'].rolling(window=3, center=True, min_periods=1).mean()
-        df['speed_diff'] = df['speed_smooth'].diff()
+    n = len(df)
+    if n < 3:
+        return jibes, jibes_failed
 
-        for idx in range(1, len(df)):
-            speed_before = df['speed_smooth'].iloc[idx - 1]
-            speed_after = df['speed_smooth'].iloc[idx]
+    # セグメント方位（points i -> i+1）
+    bearings = []
+    for i in range(n - 1):
+        bearings.append(bearing_between(df['latitude'].iloc[i], df['longitude'].iloc[i], df['latitude'].iloc[i + 1], df['longitude'].iloc[i + 1]))
 
-            if pd.isna(speed_before) or pd.isna(speed_after):
-                continue
+    # 差分 delta[k] = bearing[k] - bearing[k-1] (signed)
+    deltas = []
+    for k in range(1, len(bearings)):
+        deltas.append(angle_diff_signed(bearings[k - 1], bearings[k]))
 
-            abs_drop = speed_before - speed_after
-            rel_drop_actual = (abs_drop / speed_before) if speed_before > 0 else 0
+    cum = 0.0
+    start_seg = 0  # start segment index in bearings
+    sign = 0
+    k = 0
+    while k < len(deltas):
+        d = deltas[k]
+        if abs(d) < 1.0:
+            # 小さな変化はノイズとみなしてスキップ（ただし累積は継続）
+            k += 1
+            continue
 
-            # raw の前後速度も取得して追加チェックに使う
-            raw_before = df['speed'].iloc[idx - 1]
-            raw_after = df['speed'].iloc[idx]
+        dsign = 1 if d > 0 else -1
+        if sign == 0:
+            sign = dsign
+            cum = d
+            start_seg = k - 0  # bearings index start
+        elif dsign == sign:
+            cum += d
+        else:
+            # 反対向きに曲がったらリセット
+            cum = d
+            sign = dsign
+            start_seg = k
 
-            # 絶対閾値、事前速度、相対減少率を満たし、かつ raw でも減速している場合のみ検出
-            if (
-                abs_drop > speed_threshold
-                and speed_before >= min_speed_before
-                and rel_drop_actual >= rel_drop
-                and raw_before > raw_after
-            ):
-                speed_loss_raw = raw_before - raw_after
-                if speed_loss_raw <= 0:
-                    # 念のため raw の損失が正でない場合はスキップ
-                    continue
+        if abs(cum) >= angle_threshold:
+            # ジャイブ検出: start_seg のポイントから (k+1)+1 点までが該当区間
+            # bearings indices: start_seg .. (k+1)
+            start_point_idx = start_seg
+            end_point_idx = (k + 1) + 1  # bearing index +1 -> point index
 
-                jibes_failed.append({
-                    'index': idx,
-                    'latitude': df['latitude'].iloc[idx],
-                    'longitude': df['longitude'].iloc[idx],
-                    'speed_before': raw_before,
-                    'speed_after': raw_after,
-                    'speed_loss': speed_loss_raw,
-                    'time': df['time'].iloc[idx]
-                })
+            if end_point_idx >= n:
+                end_point_idx = n - 1
 
-    return jibes_failed
+            start_time = df['time'].iloc[start_point_idx]
+            end_time = df['time'].iloc[end_point_idx]
+            duration_s = (end_time - start_time).total_seconds()
+            angle_deg = abs(cum)
+            direction = 'starboard' if sign > 0 else 'port'
+
+            event = {
+                'start_index': int(start_point_idx),
+                'end_index': int(end_point_idx),
+                'start_time': start_time,
+                'end_time': end_time,
+                'duration_s': duration_s,
+                'angle_deg': angle_deg,
+                'direction': direction,
+            }
+            jibes.append(event)
+            if duration_s >= duration_threshold:
+                jibes_failed.append(event)
+
+            # 検出後は累積をリセットして、次は k+1 から再開
+            cum = 0.0
+            sign = 0
+            k = k + 1
+            continue
+
+        k += 1
+
+    return jibes, jibes_failed
 
 def detect_crashes(df, elevation_threshold=0.5):
     """沈を検出（標高が急激に低下した箇所）"""
@@ -140,14 +194,17 @@ if uploaded_file is not None:
     # 異常値を修正（移動速度が100km/h以上の場合は前値を使用）
     df.loc[df['speed'] > 100, 'speed'] = df['speed'].shift(1)
     
-    # ジャイブ失敗と沈を検出
-    jibes_failed = detect_jibes(df, speed_threshold=1.5)
+    # ジャイブ（角度ベース）と沈を検出
+    jibes, jibes_failed = detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0)
     crashes = detect_crashes(df, elevation_threshold=0.3)
-    
-    # ジャイブ成功率を計算
-    total_jibes = len(jibes_failed)
-    jibe_success_rate = max(0, 100 - (total_jibes * 20)) if total_jibes > 0 else 100
-    jibe_success_rate = min(100, jibe_success_rate)
+
+    # ジャイブ成功率を計算（失敗率ベース）
+    total_jibes = len(jibes)
+    failed_jibes = len(jibes_failed)
+    if total_jibes > 0:
+        jibe_success_rate = max(0.0, min(100.0, (1.0 - (failed_jibes / total_jibes)) * 100.0))
+    else:
+        jibe_success_rate = 100.0
     
     # 速度統計
     avg_speed = df['speed'].mean()
@@ -210,14 +267,23 @@ if uploaded_file is not None:
             weight=2
         ).add_to(m)
         
-        # ジャイブ失敗マーク（オレンジの✘）
-        for jibe in jibes_failed:
-            folium.Marker(
-                location=(jibe['latitude'], jibe['longitude']),
-                popup=f"❌ Jibe Failed<br>Speed Loss: {jibe['speed_loss']:.1f} km/h<br>Before: {jibe['speed_before']:.1f} km/h → After: {jibe['speed_after']:.1f} km/h",
-                icon=folium.Icon(color='orange', icon='times', prefix='fa', icon_color='white')
+        # ジャイブ（角度ベース）のマーク（成功:緑, 失敗:オレンジ）
+        failed_end_idxs = set([e['end_index'] for e in jibes_failed])
+        for j in jibes:
+            idx = j['end_index']
+            is_failed = idx in failed_end_idxs
+            color = 'orange' if is_failed else 'green'
+            folium.CircleMarker(
+                location=(df['latitude'].iloc[idx], df['longitude'].iloc[idx]),
+                radius=6,
+                popup=f"{'❌' if is_failed else '✅'} Jibe<br>Angle: {j['angle_deg']:.0f}°<br>Duration: {j['duration_s']:.1f}s<br>Direction: {j['direction']}",
+                color=color,
+                fill=True,
+                fillColor=color,
+                fillOpacity=0.9,
+                weight=1
             ).add_to(m)
-        
+
         # 沈マーク（赤の✘）
         for crash in crashes:
             folium.Marker(
@@ -255,13 +321,16 @@ if uploaded_file is not None:
         st.dataframe(df, use_container_width=True)
     
     with tab2:
-        st.subheader("ジャイブ失敗の詳細")
-        if jibes_failed:
-            jibes_df = pd.DataFrame(jibes_failed)
-            st.dataframe(jibes_df[['time', 'speed_before', 'speed_after', 'speed_loss']], use_container_width=True)
-            st.info(f"合計 {len(jibes_failed)} 回のジャイブ失敗を検出しました")
+        st.subheader("🌀 ジャイブの詳細")
+        if total_jibes > 0:
+            jibes_df = pd.DataFrame(jibes)
+            # 表示用に日時カラムを整形
+            jibes_df['start_time'] = jibes_df['start_time']
+            jibes_df['end_time'] = jibes_df['end_time']
+            st.dataframe(jibes_df[['start_time', 'end_time', 'duration_s', 'angle_deg', 'direction']], use_container_width=True)
+            st.info(f"合計 {total_jibes} 回のジャイブを検出しました（失敗: {failed_jibes}）")
         else:
-            st.success("🎉 ジャイブ失敗なし！完璧なセッションです！")
+            st.success("🎉 ジャイブなし！完璧なセッションです！")
     
     with tab3:
         st.subheader("沈の詳細")
