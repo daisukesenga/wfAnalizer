@@ -17,26 +17,58 @@ st.write("Wing foilセッションを詳細に分析します")
 # ファイルアップロード
 uploaded_file = st.file_uploader("GPXファイルをアップロード", type="gpx")
 
-def detect_jibes(df, speed_threshold=2.0):
-    """ジャイブ失敗を検出（速度が急激に低下した箇所）"""
+def detect_jibes(df, speed_threshold=2.0, min_speed_before=3.0, rel_drop=0.4):
+    """ジャイブ失敗を検出（速度が急激に低下した箇所）
+
+    改善点:
+    - 速度を短い窓で平滑化してノイズを低減
+    - 絶対的な速度低下（speed_threshold）に加え、
+      事前速度がある程度以上であること（min_speed_before）と
+      相対的な減少率（rel_drop）を満たす場合のみ検出する
+    """
     jibes_failed = []
-    
+
     if len(df) > 1:
-        df['speed_diff'] = df['speed'].diff()
-        
+        # 短い窓で平滑化してノイズを抑える
+        df['speed_smooth'] = df['speed'].rolling(window=3, center=True, min_periods=1).mean()
+        df['speed_diff'] = df['speed_smooth'].diff()
+
         for idx in range(1, len(df)):
-            # 速度が大きく低下した場合（ジャイブ失敗と判定）
-            if df['speed_diff'].iloc[idx] < -speed_threshold:
+            speed_before = df['speed_smooth'].iloc[idx - 1]
+            speed_after = df['speed_smooth'].iloc[idx]
+
+            if pd.isna(speed_before) or pd.isna(speed_after):
+                continue
+
+            abs_drop = speed_before - speed_after
+            rel_drop_actual = (abs_drop / speed_before) if speed_before > 0 else 0
+
+            # raw の前後速度も取得して追加チェックに使う
+            raw_before = df['speed'].iloc[idx - 1]
+            raw_after = df['speed'].iloc[idx]
+
+            # 絶対閾値、事前速度、相対減少率を満たし、かつ raw でも減速している場合のみ検出
+            if (
+                abs_drop > speed_threshold
+                and speed_before >= min_speed_before
+                and rel_drop_actual >= rel_drop
+                and raw_before > raw_after
+            ):
+                speed_loss_raw = raw_before - raw_after
+                if speed_loss_raw <= 0:
+                    # 念のため raw の損失が正でない場合はスキップ
+                    continue
+
                 jibes_failed.append({
                     'index': idx,
                     'latitude': df['latitude'].iloc[idx],
                     'longitude': df['longitude'].iloc[idx],
-                    'speed_before': df['speed'].iloc[idx - 1],
-                    'speed_after': df['speed'].iloc[idx],
-                    'speed_loss': df['speed'].iloc[idx - 1] - df['speed'].iloc[idx],
+                    'speed_before': raw_before,
+                    'speed_after': raw_after,
+                    'speed_loss': speed_loss_raw,
                     'time': df['time'].iloc[idx]
                 })
-    
+
     return jibes_failed
 
 def detect_crashes(df, elevation_threshold=0.5):
