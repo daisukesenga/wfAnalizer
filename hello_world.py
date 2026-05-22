@@ -37,11 +37,12 @@ def angle_diff_signed(a, b):
     return diff
 
 
-def detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0, min_angle=10.0):
-    """トラックの方位変化からジャイブを検出する。
+def detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0, min_angle=10.0, window_size=20):
+    """連続した20ポイントでジャイブを判定する。
 
-    - ジャイブ: 連続した方位変化の累積が min_angle 以上かつ angle_threshold 以下（度）
-    - 失敗ジャイブ: ジャイブの所要時間が duration_threshold 秒以上
+    - ジャイブ: 20ポイントのウィンドウ内で開始向きと終了向きの差が
+      min_angle 以上かつ angle_threshold 以下（度）の場合
+    - 失敗ジャイブ: そのウィンドウの時間が duration_threshold 秒以上
 
     戻り値: (jibes_all, jibes_failed)
     各要素は dict: start_index,end_index,start_time,end_time,duration_s,angle_deg,direction
@@ -50,7 +51,7 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0, min
     jibes_failed = []
 
     n = len(df)
-    if n < 3:
+    if n < window_size:
         return jibes, jibes_failed
 
     # セグメント方位（points i -> i+1）
@@ -58,87 +59,35 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0, min
     for i in range(n - 1):
         bearings.append(bearing_between(df['latitude'].iloc[i], df['longitude'].iloc[i], df['latitude'].iloc[i + 1], df['longitude'].iloc[i + 1]))
 
-    # 差分 delta[k] = bearing[k] - bearing[k-1] (signed)
-    deltas = []
-    for k in range(1, len(bearings)):
-        deltas.append(angle_diff_signed(bearings[k - 1], bearings[k]))
+    i = 0
+    while i <= n - window_size:
+        start_idx = i
+        end_idx = i + window_size - 1
+        start_bearing = bearings[start_idx]
+        end_bearing = bearings[end_idx - 1]
+        angle_deg = abs(angle_diff_signed(start_bearing, end_bearing))
 
-    cum = 0.0
-    start_seg = 0  # start segment index in bearings
-    sign = 0
-    k = 0
-    while k < len(deltas):
-        d = deltas[k]
-        if abs(d) < 1.0:
-            k += 1
-            continue
-
-        dsign = 1 if d > 0 else -1
-        if sign == 0:
-            sign = dsign
-            cum = d
-            start_seg = k
-        elif dsign == sign:
-            cum += d
-        else:
-            # 反対向きに曲がったら現在のターンを確定
-            angle_deg = abs(cum)
-            if min_angle <= angle_deg <= angle_threshold:
-                start_point_idx = start_seg
-                end_point_idx = k + 1
-                if end_point_idx >= n:
-                    end_point_idx = n - 1
-
-                start_time = df['time'].iloc[start_point_idx]
-                end_time = df['time'].iloc[end_point_idx]
-                duration_s = (end_time - start_time).total_seconds()
-                direction = 'starboard' if sign > 0 else 'port'
-
-                event = {
-                    'start_index': int(start_point_idx),
-                    'end_index': int(end_point_idx),
-                    'start_time': start_time,
-                    'end_time': end_time,
-                    'duration_s': duration_s,
-                    'angle_deg': angle_deg,
-                    'direction': direction,
-                }
-                jibes.append(event)
-                if duration_s >= duration_threshold:
-                    jibes_failed.append(event)
-
-            cum = d
-            sign = dsign
-            start_seg = k
-
-        k += 1
-
-    # 最後のターンを処理
-    if sign != 0:
-        angle_deg = abs(cum)
         if min_angle <= angle_deg <= angle_threshold:
-            start_point_idx = start_seg
-            end_point_idx = len(bearings)
-            if end_point_idx >= n:
-                end_point_idx = n - 1
-
-            start_time = df['time'].iloc[start_point_idx]
-            end_time = df['time'].iloc[end_point_idx]
+            start_time = df['time'].iloc[start_idx]
+            end_time = df['time'].iloc[end_idx]
             duration_s = (end_time - start_time).total_seconds()
-            direction = 'starboard' if sign > 0 else 'port'
+            direction = 'starboard' if angle_diff_signed(start_bearing, end_bearing) > 0 else 'port'
 
             event = {
-                'start_index': int(start_point_idx),
-                'end_index': int(end_point_idx),
+                'start_index': int(start_idx),
+                'end_index': int(end_idx),
                 'start_time': start_time,
                 'end_time': end_time,
                 'duration_s': duration_s,
-                'angle_deg': angle_deg,
+                'angle_deg': float(angle_deg),
                 'direction': direction,
             }
             jibes.append(event)
             if duration_s >= duration_threshold:
                 jibes_failed.append(event)
+            i += window_size
+        else:
+            i += 1
 
     return jibes, jibes_failed
 
