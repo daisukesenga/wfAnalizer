@@ -70,14 +70,14 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, window_size=20, min_avg_spee
         return np.degrees(np.arctan2(y, x)) % 360
 
     k = window_size
-    while k <= len(bearings) - window_size:
-        prev_mean = circular_mean(bearings[k - window_size:k])
-        next_mean = circular_mean(bearings[k:k + window_size])
-        angle_deg = abs(angle_diff_signed(prev_mean, next_mean))
+    while k < len(bearings):
+        prev_bearing = bearings[k - window_size]
+        current_bearing = bearings[k]
+        angle_deg = abs(angle_diff_signed(prev_bearing, current_bearing))
 
         if angle_deg >= angle_threshold:
             start_idx = k - window_size
-            end_idx = k + window_size
+            end_idx = k + 1
             start_time = pd.to_datetime(df['time'].iloc[start_idx])
             end_time = pd.to_datetime(df['time'].iloc[end_idx])
             duration_s = (end_time - start_time).total_seconds()
@@ -85,7 +85,7 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, window_size=20, min_avg_spee
             window_speeds = df['speed'].iloc[start_idx:end_idx + 1] if 'speed' in df.columns else pd.Series([0.0])
             avg_speed = window_speeds.mean() if len(window_speeds) > 0 else 0.0
             if avg_speed >= min_avg_speed:
-                direction = 'starboard' if angle_diff_signed(prev_mean, next_mean) > 0 else 'port'
+                direction = 'starboard' if angle_diff_signed(prev_bearing, current_bearing) > 0 else 'port'
                 event = {
                     'start_index': int(start_idx),
                     'end_index': int(end_idx),
