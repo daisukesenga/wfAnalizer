@@ -294,8 +294,24 @@ if uploaded_file is not None:
             weight=2
         ).add_to(m)
         
-        # ジャイブ（角度ベース）のマーク（成功:緑, 失敗:オレンジ）
+        # ジャイブ区間を太ラインで描画（成功:緑, 失敗:オレンジ）
         failed_end_idxs = set([e['end_index'] for e in jibes_failed])
+        for j in jibes:
+            idx_start = j['start_index']
+            idx_end = j['end_index']
+            is_failed = j['end_index'] in failed_end_idxs
+            color = 'orange' if is_failed else 'green'
+            folium.PolyLine(
+                locations=[
+                    (df['latitude'].iloc[k], df['longitude'].iloc[k])
+                    for k in range(idx_start, min(idx_end + 1, len(df)))
+                ],
+                color=color,
+                weight=8,
+                opacity=0.8,
+            ).add_to(m)
+
+        # ジャイブ（角度ベース）のマーク（成功:緑, 失敗:オレンジ）
         for j in jibes:
             idx = j['end_index']
             is_failed = idx in failed_end_idxs
