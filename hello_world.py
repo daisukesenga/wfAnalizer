@@ -41,7 +41,7 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0, min
     """連続した20ポイントでジャイブを判定する。
 
     - ジャイブ: 20ポイントのウィンドウ内で開始向きと終了向きの差が
-      min_angle 以上かつ angle_threshold 以下（度）の場合
+      `angle_threshold` 以上（度）の場合（ユーザ定義: 緑→青 の角度が 120°以上）
     - 失敗ジャイブ: そのウィンドウの時間が duration_threshold 秒以上
 
     戻り値: (jibes_all, jibes_failed)
@@ -67,7 +67,8 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0, min
         end_bearing = bearings[end_idx - 1]
         angle_deg = abs(angle_diff_signed(start_bearing, end_bearing))
 
-        if min_angle <= angle_deg <= angle_threshold:
+        # ユーザー定義: 緑矢印と青矢印の角度が閾値以上ならジャイブ
+        if angle_deg >= angle_threshold:
             start_time = df['time'].iloc[start_idx]
             end_time = df['time'].iloc[end_idx]
             duration_s = (end_time - start_time).total_seconds()
