@@ -37,12 +37,14 @@ def angle_diff_signed(a, b):
     return diff
 
 
-def detect_jibes_by_turn(df, angle_threshold=60.0, duration_threshold=20.0, min_angle=10.0, min_avg_speed=5.0):
-    """20秒以内の区間でジャイブを判定する。
+def detect_jibes_by_turn(df, angle_threshold=120.0, window_size=20, min_avg_speed=5.0, fail_duration_threshold=20.0):
+    """前後20ベクトルの角度差でジャイブを判定する。
 
-    - ジャイブ: 進入角度と脱出角度の差が `min_angle` 以上かつ `angle_threshold` 以下（度）で、
-      開始から終了までの時間が `duration_threshold` 秒以内の場合。
-    - 速度条件: 区間内の平均速度が `min_avg_speed` km/h 未満なら無視。
+    - 各連続2点間のベクトルを計算し、
+      前後 `window_size` ベクトルの平均向きの差が `angle_threshold` 以上ならジャイブ。
+    - 判定対象には前後 `window_size` ベクトルが存在する区間のみを使用。
+    - 速度条件: 区間の平均速度が `min_avg_speed` km/h 未満なら無視。
+    - 失敗ジャイブ: 区間時間が `fail_duration_threshold` 秒以上の場合。
 
     戻り値: (jibes_all, jibes_failed)
     各要素は dict: start_index,end_index,start_time,end_time,duration_s,angle_deg,direction
@@ -51,64 +53,55 @@ def detect_jibes_by_turn(df, angle_threshold=60.0, duration_threshold=20.0, min_
     jibes_failed = []
 
     n = len(df)
-    if n < 2:
+    if n < window_size * 2 + 1:
         return jibes, jibes_failed
 
-    # セグメント方位（points i -> i+1）
-    bearings = []
-    for i in range(n - 1):
-        bearings.append(bearing_between(df['latitude'].iloc[i], df['longitude'].iloc[i], df['latitude'].iloc[i + 1], df['longitude'].iloc[i + 1]))
+    bearings = [
+        bearing_between(
+            df['latitude'].iloc[i], df['longitude'].iloc[i],
+            df['latitude'].iloc[i + 1], df['longitude'].iloc[i + 1]
+        )
+        for i in range(n - 1)
+    ]
 
-    i = 0
-    while i < n - 1:
-        start_idx = i
-        start_time = pd.to_datetime(df['time'].iloc[start_idx])
-        start_bearing = bearings[start_idx]
-        found = False
+    def circular_mean(angles):
+        x = np.cos(np.radians(angles)).mean()
+        y = np.sin(np.radians(angles)).mean()
+        return np.degrees(np.arctan2(y, x)) % 360
 
-        # 20秒以内の最大区間を探す
-        end_idx = start_idx + 1
-        last_valid_end = None
-        while end_idx < n:
+    k = window_size
+    while k <= len(bearings) - window_size:
+        prev_mean = circular_mean(bearings[k - window_size:k])
+        next_mean = circular_mean(bearings[k:k + window_size])
+        angle_deg = abs(angle_diff_signed(prev_mean, next_mean))
+
+        if angle_deg >= angle_threshold:
+            start_idx = k - window_size
+            end_idx = k + window_size
+            start_time = pd.to_datetime(df['time'].iloc[start_idx])
             end_time = pd.to_datetime(df['time'].iloc[end_idx])
             duration_s = (end_time - start_time).total_seconds()
-            if duration_s > duration_threshold:
-                break
-            last_valid_end = end_idx
-            end_idx += 1
 
-        if last_valid_end is None:
-            i += 1
-            continue
+            window_speeds = df['speed'].iloc[start_idx:end_idx + 1] if 'speed' in df.columns else pd.Series([0.0])
+            avg_speed = window_speeds.mean() if len(window_speeds) > 0 else 0.0
+            if avg_speed >= min_avg_speed:
+                direction = 'starboard' if angle_diff_signed(prev_mean, next_mean) > 0 else 'port'
+                event = {
+                    'start_index': int(start_idx),
+                    'end_index': int(end_idx),
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'duration_s': duration_s,
+                    'angle_deg': float(angle_deg),
+                    'direction': direction,
+                }
+                jibes.append(event)
+                if duration_s >= fail_duration_threshold:
+                    jibes_failed.append(event)
+                k = end_idx + 1
+                continue
 
-        end_bearing = bearings[last_valid_end - 1]
-        angle_deg = abs(angle_diff_signed(start_bearing, end_bearing))
-        if angle_deg < min_angle or angle_deg > angle_threshold:
-            i += 1
-            continue
-
-        window_speeds = df['speed'].iloc[start_idx:last_valid_end + 1] if 'speed' in df.columns else pd.Series([0.0])
-        avg_speed = window_speeds.mean() if len(window_speeds) > 0 else 0.0
-        if avg_speed < min_avg_speed:
-            i += 1
-            continue
-
-        end_time = pd.to_datetime(df['time'].iloc[last_valid_end])
-        duration_s = (end_time - start_time).total_seconds()
-        direction = 'starboard' if angle_diff_signed(start_bearing, end_bearing) > 0 else 'port'
-        event = {
-            'start_index': int(start_idx),
-            'end_index': int(last_valid_end),
-            'start_time': start_time,
-            'end_time': end_time,
-            'duration_s': duration_s,
-            'angle_deg': float(angle_deg),
-            'direction': direction,
-        }
-        jibes.append(event)
-        if duration_s >= duration_threshold:
-            jibes_failed.append(event)
-        i = last_valid_end + 1
+        k += 1
 
     return jibes, jibes_failed
 
@@ -225,8 +218,8 @@ if uploaded_file is not None:
     # 異常値を修正（移動速度が100km/h以上の場合は前値を使用）
     df.loc[df['speed'] > 100, 'speed'] = df['speed'].shift(1)
     
-    # ジャイブ（角度ベース）と沈を検出
-    jibes, jibes_failed = detect_jibes_by_turn(df, angle_threshold=60.0, duration_threshold=20.0)
+    # ジャイブ（ベクトル前後20本の角度差）と沈を検出
+    jibes, jibes_failed = detect_jibes_by_turn(df, angle_threshold=120.0, window_size=20)
     crashes = detect_crashes(df, elevation_threshold=0.3)
     # 速度低下による沈も検出（5 km/h閾値、継続10秒）
     speed_crashes = detect_speed_drop_crashes(df, speed_threshold=5.0, sustained_seconds=10)
