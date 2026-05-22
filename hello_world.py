@@ -67,6 +67,15 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0, min
         end_bearing = bearings[end_idx - 1]
         angle_deg = abs(angle_diff_signed(start_bearing, end_bearing))
 
+        # 速度条件: ウィンドウ内の平均速度が閾値未満ならカウントしない
+        window_speeds = None
+        if 'speed' in df.columns:
+            window_speeds = df['speed'].iloc[start_idx:end_idx+1]
+        avg_speed = window_speeds.mean() if window_speeds is not None and len(window_speeds) > 0 else 0.0
+        if avg_speed < 5.0:
+            i += 1
+            continue
+
         # ユーザー定義: 緑矢印と青矢印の角度が閾値以上ならジャイブ
         if angle_deg >= angle_threshold:
             start_time = df['time'].iloc[start_idx]
@@ -113,6 +122,48 @@ def detect_crashes(df, elevation_threshold=0.5):
                 })
     
     return crashes
+
+
+def detect_speed_drop_crashes(df, speed_threshold=5.0, sustained_seconds=10):
+    """速度による沈を検出.
+
+    - 条件: 直前の連続した区間で速度が `speed_threshold` 以上が
+      `sustained_seconds` 以上続いた後、現在点で速度が `speed_threshold` 未満になった場合。
+
+    戻り値: list of crashes with keys: index, latitude, longitude, time, prior_start_time, prior_end_time, prior_duration_s
+    """
+    crashes = []
+    if 'speed' not in df.columns or len(df) < 2:
+        return crashes
+
+    speeds = df['speed'].fillna(0).values
+
+    for i in range(1, len(df)):
+        # 現在点が閾値未満で、直前は閾値以上であった場合にのみ検査
+        if speeds[i] < speed_threshold and speeds[i-1] >= speed_threshold:
+            # 直前の連続区間の開始を探す
+            j = i-1
+            while j >= 0 and speeds[j] >= speed_threshold:
+                j -= 1
+            start_idx = j + 1
+            end_idx = i - 1
+            # 時間差を計算
+            start_time = pd.to_datetime(df['time'].iloc[start_idx])
+            end_time = pd.to_datetime(df['time'].iloc[end_idx])
+            prior_duration_s = (end_time - start_time).total_seconds()
+            if prior_duration_s >= sustained_seconds:
+                crashes.append({
+                    'index': int(i),
+                    'latitude': df['latitude'].iloc[i],
+                    'longitude': df['longitude'].iloc[i],
+                    'time': df['time'].iloc[i],
+                    'prior_start_time': start_time,
+                    'prior_end_time': end_time,
+                    'prior_duration_s': prior_duration_s,
+                })
+
+    return crashes
+
 
 def get_speed_color(speed, vmin, vmax):
     """速度に基づいて色を取得"""
@@ -165,6 +216,10 @@ if uploaded_file is not None:
     # ジャイブ（角度ベース）と沈を検出
     jibes, jibes_failed = detect_jibes_by_turn(df, angle_threshold=120.0, duration_threshold=20.0)
     crashes = detect_crashes(df, elevation_threshold=0.3)
+    # 速度低下による沈も検出（5 km/h閾値、継続10秒）
+    speed_crashes = detect_speed_drop_crashes(df, speed_threshold=5.0, sustained_seconds=10)
+    if speed_crashes:
+        crashes.extend(speed_crashes)
 
     # ジャイブ成功率を計算（失敗率ベース）
     total_jibes = len(jibes)
