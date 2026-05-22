@@ -103,7 +103,12 @@ def detect_jibes_by_turn(df, angle_threshold=120.0, window_size=20, min_avg_spee
                 jibes.append(event)
                 if duration_s >= fail_duration_threshold:
                     jibes_failed.append(event)
-                k = end_idx + 1
+
+                # 重複を避けるため、脱出区間の20ポイント先から次の探索を開始する
+                next_k = end_idx + 20
+                if next_k >= len(bearings):
+                    break
+                k = next_k
                 continue
 
         k += 1
