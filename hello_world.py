@@ -149,9 +149,10 @@ def detect_crashes(df, elevation_threshold=0.5):
 
 def get_speed_color(speed, vmin, vmax):
     """速度に基づいて色を取得"""
+    speed_clamped = min(speed, vmax)
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
     cmap = plt.cm.get_cmap('RdYlBu_r')
-    return mcolors.to_hex(cmap(norm(speed)))
+    return mcolors.to_hex(cmap(norm(speed_clamped)))
 
 if uploaded_file is not None:
     gpx_file = gpxpy.parse(uploaded_file)
@@ -227,8 +228,7 @@ if uploaded_file is not None:
         )
         
         # 速度に基づいて軌跡を描画
-        vmin, vmax = df['speed'].min(), df['speed'].max()
-        
+        vmin, vmax = df['speed'].min(), 20.0
         for i in range(len(df) - 1):
             color = get_speed_color(df['speed'].iloc[i], vmin, vmax)
             
@@ -314,17 +314,12 @@ if uploaded_file is not None:
     
     # 詳細分析タブ
     st.divider()
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 詳細データ", "❌ ジャイブ失敗", "💧 沈", "📈 速度グラフ"])
-    
-    with tab1:
-        st.subheader("全トラックデータ")
-        st.dataframe(df, use_container_width=True)
+    tab2, tab3, tab4 = st.tabs(["❌ ジャイブ失敗", "💧 沈", "📈 速度グラフ"])
     
     with tab2:
         st.subheader("🌀 ジャイブの詳細")
         if total_jibes > 0:
             jibes_df = pd.DataFrame(jibes)
-            # 表示用に日時カラムを整形
             jibes_df['start_time'] = jibes_df['start_time']
             jibes_df['end_time'] = jibes_df['end_time']
             st.dataframe(jibes_df[['start_time', 'end_time', 'duration_s', 'angle_deg', 'direction']], use_container_width=True)
