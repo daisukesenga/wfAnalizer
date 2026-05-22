@@ -160,6 +160,7 @@ def detect_speed_drop_crashes(df, speed_threshold=5.0, sustained_seconds=10):
                     'prior_start_time': start_time,
                     'prior_end_time': end_time,
                     'prior_duration_s': prior_duration_s,
+                    'crash_type': 'speed_drop',
                 })
 
     return crashes
@@ -308,9 +309,20 @@ if uploaded_file is not None:
 
         # 沈マーク（赤の✘）
         for crash in crashes:
+            if crash.get('crash_type') == 'speed_drop':
+                popup_text = (
+                    f"💧 Crash (speed drop)<br>Prior run: {crash['prior_duration_s']:.0f}s @ ≥5 km/h<br>"
+                    f"Dropped below 5 km/h at {crash['time']}"
+                )
+            else:
+                popup_text = (
+                    f"💧 Crash<br>Elevation Loss: {crash['elevation_loss']:.1f}m<br>"
+                    f"Before: {crash['elevation_before']:.1f}m → After: {crash['elevation_after']:.1f}m"
+                )
+
             folium.Marker(
                 location=(crash['latitude'], crash['longitude']),
-                popup=f"💧 Crash<br>Elevation Loss: {crash['elevation_loss']:.1f}m<br>Before: {crash['elevation_before']:.1f}m → After: {crash['elevation_after']:.1f}m",
+                popup=popup_text,
                 icon=folium.Icon(color='red', icon='times', prefix='fa', icon_color='white')
             ).add_to(m)
         
