@@ -9,7 +9,7 @@ from geopy.distance import geodesic
 # ページの設定
 st.set_page_config(page_title="Wing Foil GPX Analyzer", layout="wide")
 st.title("🏄‍♂️ ウィングフォイル GPXアナライザー")
-st.write("GPXファイルをアップロードして、左右別のジャイブ成功率や沈（ワイプアウト）ポイントを分析します。")
+st.write("GPXファイルをアップロードして、左右別のジャイブ成功率、区間距離、フォイル速度の統計を分析します。")
 
 # --- サイドバーの設定 ---
 st.sidebar.header("⚙️ 解析パラメータ設定")
@@ -68,34 +68,33 @@ if uploaded_file is not None:
         df = pd.DataFrame(raw_data)
         df['time'] = pd.to_datetime(df['time'])
         
-        # 💡 【時間の補正を撤廃】
-        # ファイル内の時刻がすでに日本時間なので、タイムゾーン情報を剥ぎ取って純粋なローカル時間として扱います
+        # ファイル内の時刻をそのままローカル時間として扱う
         df['time'] = df['time'].dt.tz_localize(None)
-        
-        # 表示用の文字列フォーマット
         df['time_jst_str'] = df['time'].dt.strftime('%H:%M:%S')
         
-        # 【位置データのスムージング】
+        # 位置データのスムージング
         if smoothing_window > 1:
             df['lat'] = df['lat'].rolling(window=smoothing_window, min_periods=1, center=True).mean()
             df['lon'] = df['lon'].rolling(window=smoothing_window, min_periods=1, center=True).mean()
 
-        # 2. 速度・時間差・方位角の計算
+        # 2. 速度・時間差・方位角・移動距離の計算
         df['time_diff'] = df['time'].diff().dt.total_seconds()
         
         speeds = [0.0]
         bearings = [0.0]
+        distances = [0.0] # 💡 各点間の移動距離（メートル）
         
         for i in range(1, len(df)):
             p1 = (df.loc[i-1, 'lat'], df.loc[i-1, 'lon'])
             p2 = (df.loc[i, 'lat'], df.loc[i, 'lon'])
             t_diff = df.loc[i, 'time_diff']
             
+            dist = geodesic(p1, p2).meters
+            distances.append(dist)
+            
             if t_diff > 0:
-                dist = geodesic(p1, p2).meters
                 speed_kmh = (dist / t_diff) * 3.6
                 speeds.append(speed_kmh)
-                
                 brng = calculate_bearing(p1[0], p1[1], p2[0], p2[1])
                 bearings.append(brng)
             else:
@@ -104,6 +103,7 @@ if uploaded_file is not None:
                 
         df['speed'] = speeds
         df['bearing'] = bearings
+        df['distance_m'] = distances
         
         # 3. データの平滑化
         df = df[df['speed'] < speed_max_limit].reset_index(drop=True)
@@ -215,116 +215,32 @@ if uploaded_file is not None:
     total_left_jibes = left_jibe_success + left_jibe_fail
     left_jibe_ratio = (left_jibe_success / total_left_jibes) * 100 if total_left_jibes > 0 else 0
 
-    # --- UI表示エリア ---
+    # 💡 --- 新設：走行距離およびフォイル速度の統計計算 ---
+    # 通常走行（normal および wipeout_line）の距離
+    normal_distance_km = df[df['segment_type'].isin(['normal', 'wipeout_line'])]['distance_m'].sum() / 1000.0
+    # ジャイブ区間（success および fail）の距離
+    jibe_distance_km = df[df['segment_type'].isin(['success', 'fail'])]['distance_m'].sum() / 1000.0
+    
+    # フォイリング中（is_foiling == True）の速度データ抽出
+    foiling_speeds = df[df['is_foiling'] == True]['speed_smooth']
+    if not foiling_speeds.empty:
+        foil_mean_speed = foiling_speeds.mean()
+        foil_median_speed = foiling_speeds.median()
+    else:
+        foil_mean_speed = 0.0
+        foil_median_speed = 0.0
+
+    # --- UI表示エリア （上段：基本メリック） ---
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("🚀 最高速度", f"{df['speed_smooth'].max():.1f} km/h")
     col2.metric("➡️ 右ターン(時計回り) 成功率", f"{right_jibe_ratio:.1f} %", f"成功:{right_jibe_success} / 全体:{total_right_jibes}")
     col3.metric("⬅️ 左ターン(反時計) 成功率", f"{left_jibe_ratio:.1f} %", f"成功:{left_jibe_success} / 全体:{total_left_jibes}")
     col4.metric("⚠️ 直線からの沈回数", f"{wipeout_count} 回")
     
-    st.markdown("---")
-    
-    left_col, right_col = st.columns([6, 4])
-    
-    with left_col:
-        st.subheader("🗺️ セッションマップ（成功＝緑 / 失敗＝赤 / 直線沈＝黄線）")
-        
-        fig_map = go.Figure()
-        
-        # --- 1. ベースの通常走行軌跡（グレー） ---
-        fig_map.add_trace(go.Scattermapbox(
-            lat=df['lat'], lon=df['lon'],
-            mode='lines',
-            line=dict(width=2, color='#A0AEC0'), 
-            name='通常走行（直線含む）',
-            hoverinfo='text',
-            text=df.apply(lambda row: f"時刻: {row['time_jst_str']}<br>速度: {row['speed_smooth']:.1f} km/h", axis=1)
-        ))
-        
-        # --- 2. 各種イベント区間の重ね描き ---
-        df['type_block'] = (df['segment_type'] != df['segment_type'].shift()).cumsum()
-        
-        success_legend = False
-        fail_legend = False
-        wipeout_legend = False
-        
-        for b_id, block in df.groupby('type_block'):
-            seg_type = block['segment_type'].iloc[0]
-            if seg_type == 'normal':
-                continue
-                
-            start_idx = max(0, block.index.min() - 1)
-            end_idx = min(len(df) - 1, block.index.max() + 1)
-            sub_seg = df.loc[start_idx:end_idx]
-            
-            if seg_type == 'success':
-                color = '#2ECC71'
-                name = 'ジャイブ成功区間'
-                show_leg = not success_legend
-                success_legend = True
-                width = 5
-            elif seg_type == 'fail':
-                color = '#E74C3C'
-                name = 'ジャイブ失敗区間'
-                show_leg = not fail_legend
-                fail_legend = True
-                width = 5
-            elif seg_type == 'wipeout_line':
-                color = '#F1C40F'
-                name = '直線からの沈（落水減速区間）'
-                show_leg = not wipeout_legend
-                wipeout_legend = True
-                width = 5.5
-                
-            fig_map.add_trace(go.Scattermapbox(
-                lat=sub_seg['lat'], lon=sub_seg['lon'],
-                mode='lines',
-                line=dict(width=width, color=color),
-                name=name,
-                showlegend=show_leg,
-                hoverinfo='text',
-                text=sub_seg.apply(lambda row: f"時刻: {row['time_jst_str']}<br>速度: {row['speed_smooth']:.1f} km/h", axis=1)
-            ))
-            
-        fig_map.update_layout(
-            mapbox=dict(
-                style="open-street-map",
-                center=dict(lat=df['lat'].mean(), lon=df['lon'].mean()),
-                zoom=14
-            ),
-            margin={"r":0,"t":0,"l":0,"b":0},
-            height=550,
-            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(255,255,255,0.9)")
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
-        
-    with right_col:
-        st.subheader("📈 タイムライン分析")
-        
-        fig_speed = px.line(
-            df, x='time', y='speed_smooth',
-            title="速度推移 (km/h)",
-            labels={'speed_smooth': '速度 (km/h)', 'time': '時刻'}
-        )
-        fig_speed.add_hline(y=foil_start_threshold, line_dash="dash", line_color="red", annotation_text="開始閾値")
-        fig_speed.add_hline(y=foil_end_threshold, line_dash="dot", line_color="orange", annotation_text="終了閾値")
-        
-        for w_time in wipeout_times:
-            fig_speed.add_vline(x=w_time, line_color="black", line_dash="dash")
-            
-        fig_speed.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
-        st.plotly_chart(fig_speed, use_container_width=True)
-        
-        fig_bearing = px.line(
-            df, x='time', y='bearing',
-            title="進行方向（方位/0-360度）",
-            labels={'bearing': '方位角 (度)', 'time': '時刻'}
-        )
-        fig_bearing.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
-        st.plotly_chart(fig_bearing, use_container_width=True)
-
-    with st.expander("📂 解析データテーブルの表示"):
-        st.dataframe(df[['time_jst_str', 'speed_smooth', 'bearing', 'turn_cum', 'is_foiling', 'segment_type']].rename(columns={'time_jst_str': '時刻'}).head(100))
-
-else:
-    st.info("👆 上記のエリアにスマートウォッチやGPSロガーから出力したGPXファイルをアップロードしてください。")
+    # 💡 --- UI表示エリア （中段：ご要望の各種統計を配置） ---
+    st.markdown("### 📊 走行距離＆フォイリング速度統計")
+    stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+    stat_col1.metric("🛣️ 通常走行 合計距離", f"{normal_distance_km:.2f} km")
+    stat_col2.metric("🔄 ジャイブ区間 合計距離", f"{jibe_distance_km:.2f} km", "成功＋失敗の合計")
+    stat_col3.metric("📈 フォイル中 平均速度", f"{foil_mean_speed:.1f} km/h")
+    stat_col4.metric("🎯 フォイル中 中央値速度", f"{foil_median_speed:.1f} km/h")
