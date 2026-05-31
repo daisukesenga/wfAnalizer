@@ -9,7 +9,7 @@ from geopy.distance import geodesic
 # ページの設定
 st.set_page_config(page_title="Wing Foil GPX Analyzer", layout="wide")
 st.title("🏄‍♂️ ウィングフォイル GPXアナライザー")
-st.write("GPXファイルをアップロードして、ジャイブ成功率や沈（ワイプアウト）ポイントを分析します。")
+st.write("GPXファイルをアップロードして、左右別のジャイブ成功率や沈（ワイプアウト）ポイントを分析します。")
 
 # --- サイドバーの設定 ---
 st.sidebar.header("⚙️ 解析パラメータ設定")
@@ -105,10 +105,16 @@ if uploaded_file is not None:
         df = df[df['speed'] < speed_max_limit].reset_index(drop=True)
         df['speed_smooth'] = df['speed'].rolling(window=smoothing_window, min_periods=1, center=True).mean()
         
-        # 4. 特徴量の計算（方位角の変化量）
-        df['bearing_diff'] = df['bearing'].diff().abs()
-        df['bearing_diff'] = df['bearing_diff'].map(lambda x: 360 - x if x > 180 else x)
+        # 4. 特徴量の計算（方位角の変化量・符号付き変化量）
+        # 💡 左右判定のために符号付きの変化量を計算
+        raw_bearing_diff = df['bearing'].diff()
+        # 180度をまたぐ場合の補正
+        raw_bearing_diff = raw_bearing_diff.map(lambda x: x - 360 if x > 180 else (x + 360 if x < -180 else x))
+        df['bearing_diff_signed'] = raw_bearing_diff
+        df['bearing_diff'] = df['bearing_diff_signed'].abs()
+        
         df['turn_cum'] = df['bearing_diff'].rolling(window=5, min_periods=1).sum()
+        df['turn_dir_cum'] = df['bearing_diff_signed'].rolling(window=5, min_periods=1).sum()
 
     # --- 🏄‍♂️ フォイリング状態追跡ロジック ---
     is_foiling_list = []
@@ -129,8 +135,11 @@ if uploaded_file is not None:
     df['is_straight'] = df['turn_cum'] <= jibe_turn_angle_threshold
     jibe_zone = df[df['turn_cum'] > jibe_turn_angle_threshold]
     
-    jibe_success_count = 0
-    jibe_fail_count = 0
+    # 💡 左右別のカウント用変数を定義
+    right_jibe_success = 0
+    right_jibe_fail = 0
+    left_jibe_success = 0
+    left_jibe_fail = 0
     
     df['segment_type'] = 'normal'
     
@@ -145,12 +154,21 @@ if uploaded_file is not None:
             if df.loc[entry_idx, 'is_foiling']:
                 min_speed_in_turn = group['speed_smooth'].min()
                 
+                # 💡 ターン中の累積角度の合計から、右回りか左回りかを判定
+                is_right_turn = group['turn_dir_cum'].sum() >= 0
+                
                 if min_speed_in_turn >= jibe_speed_threshold:
-                    jibe_success_count += 1
                     df.loc[group.index, 'segment_type'] = 'success'
+                    if is_right_turn:
+                        right_jibe_success += 1
+                    else:
+                        left_jibe_success += 1
                 else:
-                    jibe_fail_count += 1
                     df.loc[group.index, 'segment_type'] = 'fail'
+                    if is_right_turn:
+                        right_jibe_fail += 1
+                    else:
+                        left_jibe_fail += 1
                     
     # 【ステップ2】直線フォイリング中を一時的にマーク（内部計算用）
     df.loc[(df['segment_type'] == 'normal') & (df['is_straight']) & (df['is_foiling']), 'segment_type'] = 'straight_internal'
@@ -184,7 +202,6 @@ if uploaded_file is not None:
                     if duration >= 10:
                         wipeout_count += 1
                         wipeout_times.append(df.loc[fall_idx, 'time'])
-                        # 着水から完全に失速・停止するまでの区間を「沈区間」としてマーク
                         end_red_idx = min(fall_idx + 10, k, n - 1)
                         df.loc[fall_idx:end_red_idx, 'segment_type'] = 'wipeout_line'
                     i = k
@@ -196,14 +213,19 @@ if uploaded_file is not None:
     # 内部用の直線マークを通常（normal）に戻す
     df.loc[df['segment_type'] == 'straight_internal', 'segment_type'] = 'normal'
                 
-    total_jibes = jibe_success_count + jibe_fail_count
-    jibe_success_ratio = (jibe_success_count / total_jibes) * 100 if total_jibes > 0 else 0
+    # 💡 左右別の成功率計算
+    total_right_jibes = right_jibe_success + right_jibe_fail
+    right_jibe_ratio = (right_jibe_success / total_right_jibes) * 100 if total_right_jibes > 0 else 0
+    
+    total_left_jibes = left_jibe_success + left_jibe_fail
+    left_jibe_ratio = (left_jibe_success / total_left_jibes) * 100 if total_left_jibes > 0 else 0
 
-    # --- UI表示エリア ---
-    col1, col2, col3 = st.columns(3)
+    # --- UI表示エリア （左右に分けた4列表示） ---
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("🚀 最高速度", f"{df['speed_smooth'].max():.1f} km/h")
-    col2.metric("🔄 ジャイブ成功率", f"{jibe_success_ratio:.1f} %", f"成功:{jibe_success_count} / 全体:{total_jibes}")
-    col3.metric("⚠️ 直線からの沈回数", f"{wipeout_count} 回")
+    col2.metric("➡️ 右ターン(時計回り) 成功率", f"{right_jibe_ratio:.1f} %", f"成功:{right_jibe_success} / 全体:{total_right_jibes}")
+    col3.metric("⬅️ 左ターン(反時計) 成功率", f"{left_jibe_ratio:.1f} %", f"成功:{left_jibe_success} / 全体:{total_left_jibes}")
+    col4.metric("⚠️ 直線からの沈回数", f"{wipeout_count} 回")
     
     st.markdown("---")
     
@@ -241,19 +263,19 @@ if uploaded_file is not None:
             sub_seg = df.loc[start_idx:end_idx]
             
             if seg_type == 'success':
-                color = '#2ECC71'  # ジャイブ成功：緑
+                color = '#2ECC71'
                 name = 'ジャイブ成功区間'
                 show_leg = not success_legend
                 success_legend = True
                 width = 5
             elif seg_type == 'fail':
-                color = '#E74C3C'  # ジャイブ失敗：赤
+                color = '#E74C3C'
                 name = 'ジャイブ失敗区間'
                 show_leg = not fail_legend
                 fail_legend = True
                 width = 5
             elif seg_type == 'wipeout_line':
-                color = '#F1C40F'  # 💡 ご要望通り、直線からの沈を「鮮やかな黄色」に変更
+                color = '#F1C40F'
                 name = '直線からの沈（落水減速区間）'
                 show_leg = not wipeout_legend
                 wipeout_legend = True
@@ -266,7 +288,7 @@ if uploaded_file is not None:
                 name=name,
                 showlegend=show_leg,
                 hoverinfo='text',
-                text=sub_seg['speed_smooth'].map(lambda x: f"沈区間 速度: {x:.1f} km/h")
+                text=sub_seg['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
             ))
             
         fig_map.update_layout(
