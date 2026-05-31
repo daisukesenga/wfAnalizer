@@ -1,425 +1,238 @@
 import streamlit as st
 import gpxpy
 import pandas as pd
-import folium
-from streamlit_folium import st_folium
 import numpy as np
-from haversine import haversine, Unit
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.cm import ScalarMappable
+import plotly.express as px
+import plotly.graph_objects as go
+from geopy.distance import geodesic
 
+# ページの設定
 st.set_page_config(page_title="Wing Foil GPX Analyzer", layout="wide")
+st.title("🏄‍♂️ ウィングフォイル GPXアナライザー")
+st.write("GPXファイルをアップロードして、フォイリング率、ジャイブ成功率、沈（ワイプアウト）ポイントを分析します。")
 
-st.title("🪁 Wing Foil GPX Analyzer")
-st.write("Wing foilセッションを詳細に分析します")
+# --- サイドバーの設定 ---
+st.sidebar.header("⚙️ 解析パラメータ設定")
+foil_threshold = st.sidebar.slider("フォイリング開始速度 (km/h)", 10.0, 18.0, 13.5, 0.5)
+jibe_speed_threshold = st.sidebar.slider("ジャイブ成功とみなす最低速度 (km/h)", 8.0, 15.0, 11.0, 0.5)
+speed_max_limit = st.sidebar.number_input("GPSノイズカットの上限速度 (km/h)", 50, 100, 60)
 
-# ファイルアップロード
-uploaded_file = st.file_uploader("GPXファイルをアップロード", type="gpx")
-
-def bearing_between(lat1, lon1, lat2, lon2):
-    """2点間の方位角を度で返す（0-360）"""
-    # ラジアン変換
-    phi1 = np.radians(lat1)
-    phi2 = np.radians(lat2)
-    dlambda = np.radians(lon2 - lon1)
-
-    x = np.sin(dlambda) * np.cos(phi2)
-    y = np.cos(phi1) * np.sin(phi2) - np.sin(phi1) * np.cos(phi2) * np.cos(dlambda)
-    bearing = np.degrees(np.arctan2(x, y))
-    bearing = (bearing + 360) % 360
-    return bearing
-
-
-def angle_diff_signed(a, b):
-    """a->b の符号付き角差を -180..180 の範囲で返す"""
-    diff = (b - a + 180) % 360 - 180
-    return diff
-
-
-def detect_jibes_by_turn(df, angle_threshold=120.0, window_size=20, min_avg_speed=5.0, fail_duration_threshold=20.0):
-    """前後20ベクトルの角度差でジャイブを判定する。
-
-    - 各連続2点間のベクトルを計算し、
-      前後 `window_size` ベクトルの平均向きの差が `angle_threshold` 以上ならジャイブ。
-    - 判定対象には前後 `window_size` ベクトルが存在する区間のみを使用。
-    - 速度条件: 区間の平均速度が `min_avg_speed` km/h 未満なら無視。
-    - 失敗ジャイブ: 区間時間が `fail_duration_threshold` 秒以上の場合。
-
-    戻り値: (jibes_all, jibes_failed)
-    各要素は dict: start_index,end_index,start_time,end_time,duration_s,angle_deg,direction
-    """
-    jibes = []
-    jibes_failed = []
-
-    n = len(df)
-    if n < window_size * 2 + 1:
-        return jibes, jibes_failed
-
-    bearings = [
-        bearing_between(
-            df['latitude'].iloc[i], df['longitude'].iloc[i],
-            df['latitude'].iloc[i + 1], df['longitude'].iloc[i + 1]
-        )
-        for i in range(n - 1)
-    ]
-
-    def circular_mean(angles):
-        x = np.cos(np.radians(angles)).mean()
-        y = np.sin(np.radians(angles)).mean()
-        return np.degrees(np.arctan2(y, x)) % 360
-
-    k = window_size
-    while k < len(bearings):
-        prev_bearing = bearings[k - window_size]
-        current_bearing = bearings[k]
-        angle_deg = abs(angle_diff_signed(prev_bearing, current_bearing))
-
-        if angle_deg >= angle_threshold:
-            start_idx = k - window_size
-            end_idx = k + 1
-            start_time = pd.to_datetime(df['time'].iloc[start_idx])
-            end_time = pd.to_datetime(df['time'].iloc[end_idx])
-            duration_s = (end_time - start_time).total_seconds()
-
-            window_speeds = df['speed'].iloc[start_idx:end_idx + 1] if 'speed' in df.columns else pd.Series([0.0])
-            avg_speed = window_speeds.mean() if len(window_speeds) > 0 else 0.0
-            if avg_speed >= min_avg_speed:
-                direction = 'starboard' if angle_diff_signed(prev_bearing, current_bearing) > 0 else 'port'
-                event = {
-                    'start_index': int(start_idx),
-                    'end_index': int(end_idx),
-                    'pivot_index': int(k),
-                    'in_start': int(start_idx),
-                    'in_end': int(k),
-                    'out_start': int(k),
-                    'out_end': int(end_idx),
-                    'start_time': start_time,
-                    'end_time': end_time,
-                    'duration_s': duration_s,
-                    'angle_deg': float(angle_deg),
-                    'direction': direction,
-                }
-                jibes.append(event)
-                if duration_s >= fail_duration_threshold:
-                    jibes_failed.append(event)
-
-                # 重複を避けるため、脱出区間の20ポイント先から次の探索を開始する
-                # start_index = k - window_size なので、次の k は end_idx + window_size + 20 にする
-                next_k = end_idx + window_size + 20
-                if next_k >= len(bearings):
-                    break
-                k = next_k
-                continue
-
-        k += 1
-
-    return jibes, jibes_failed
-
-def detect_crashes(df, elevation_threshold=0.5):
-    """沈を検出（標高が急激に低下した箇所）"""
-    crashes = []
+# --- 方位角（Heading）を計算する関数 ---
+def calculate_bearing(lat1, lon1, lat2, lon2):
+    lat1_rad = np.radians(lat1)
+    lat2_rad = np.radians(lat2)
+    delta_lon = np.radians(lon2 - lon1)
     
-    if len(df) > 1 and df['elevation'].notna().any():
-        df['elevation_diff'] = df['elevation'].diff()
-        
-        for idx in range(1, len(df)):
-            # 標高が大きく低下した場合（沈と判定）
-            if pd.notna(df['elevation_diff'].iloc[idx]) and df['elevation_diff'].iloc[idx] < -elevation_threshold:
-                crashes.append({
-                    'index': idx,
-                    'latitude': df['latitude'].iloc[idx],
-                    'longitude': df['longitude'].iloc[idx],
-                    'elevation_before': df['elevation'].iloc[idx - 1],
-                    'elevation_after': df['elevation'].iloc[idx],
-                    'elevation_loss': abs(df['elevation'].iloc[idx - 1] - df['elevation'].iloc[idx]),
-                    'time': df['time'].iloc[idx]
-                })
+    y = np.sin(delta_lon) * np.cos(lat2_rad)
+    x = np.cos(lat1_rad) * np.sin(lat2_rad) - np.sin(lat1_rad) * np.cos(lat2_rad) * np.cos(delta_lon)
     
-    return crashes
+    bearing = np.degrees(np.arctan2(y, x))
+    return (bearing + 360) % 360
 
-
-def detect_speed_drop_crashes(df, speed_threshold=5.0, sustained_seconds=10):
-    """速度による沈を検出.
-
-    - 条件: 直前の連続した区間で速度が `speed_threshold` 以上が
-      `sustained_seconds` 以上続いた後、現在点で速度が `speed_threshold` 未満になった場合。
-
-    戻り値: list of crashes with keys: index, latitude, longitude, time, prior_start_time, prior_end_time, prior_duration_s
-    """
-    crashes = []
-    if 'speed' not in df.columns or len(df) < 2:
-        return crashes
-
-    speeds = df['speed'].fillna(0).values
-
-    for i in range(1, len(df)):
-        # 現在点が閾値未満で、直前は閾値以上であった場合にのみ検査
-        if speeds[i] < speed_threshold and speeds[i-1] >= speed_threshold:
-            # 直前の連続区間の開始を探す
-            j = i-1
-            while j >= 0 and speeds[j] >= speed_threshold:
-                j -= 1
-            start_idx = j + 1
-            end_idx = i - 1
-            # 時間差を計算
-            start_time = pd.to_datetime(df['time'].iloc[start_idx])
-            end_time = pd.to_datetime(df['time'].iloc[end_idx])
-            prior_duration_s = (end_time - start_time).total_seconds()
-            if prior_duration_s >= sustained_seconds:
-                crashes.append({
-                    'index': int(i),
-                    'latitude': df['latitude'].iloc[i],
-                    'longitude': df['longitude'].iloc[i],
-                    'time': df['time'].iloc[i],
-                    'prior_start_time': start_time,
-                    'prior_end_time': end_time,
-                    'prior_duration_s': prior_duration_s,
-                    'crash_type': 'speed_drop',
-                })
-
-    return crashes
-
-
-def get_speed_color(speed, vmin, vmax):
-    """速度に基づいて色を取得"""
-    speed_clamped = min(speed, vmax)
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-    cmap = plt.cm.get_cmap('RdYlBu_r')
-    return mcolors.to_hex(cmap(norm(speed_clamped)))
+# --- ファイルアップローダー ---
+uploaded_file = st.file_uploader("GPXファイルをドラッグ＆ドロップ、またはブラウズ", type=["gpx"])
 
 if uploaded_file is not None:
-    gpx_file = gpxpy.parse(uploaded_file)
-    
-    # トラック情報を抽出
-    track_data = []
-    for track in gpx_file.tracks:
-        for segment in track.segments:
-            for point in segment.points:
-                track_data.append({
-                    'latitude': point.latitude,
-                    'longitude': point.longitude,
-                    'elevation': point.elevation,
-                    'time': point.time
-                })
-    
-    df = pd.DataFrame(track_data)
-    
-    # 速度を計算（隣接ポイント間の距離と時間差から）
-    speeds = []
-    for i in range(len(df)):
-        if i == 0:
-            speeds.append(0)
-        else:
-            coords_1 = (df['latitude'].iloc[i-1], df['longitude'].iloc[i-1])
-            coords_2 = (df['latitude'].iloc[i], df['longitude'].iloc[i])
-            distance_km = haversine(coords_1, coords_2, unit=Unit.KILOMETERS)
+    # 1. GPXデータのパース
+    with st.spinner("GPXファイルを解析中..."):
+        gpx = gpxpy.parse(uploaded_file)
+        raw_data = []
+        
+        for track in gpx.tracks:
+            for segment in track.segments:
+                for point in segment.points:
+                    raw_data.append({
+                        "time": point.time,
+                        "lat": point.latitude,
+                        "lon": point.longitude
+                    })
+                    
+        if len(raw_data) < 10:
+            st.error("データポイントが少なすぎます。正しいGPXファイルか確認してください。")
+            st.stop()
             
-            time_diff = (df['time'].iloc[i] - df['time'].iloc[i-1]).total_seconds() / 3600
+        df = pd.DataFrame(raw_data)
+        df['time'] = pd.to_datetime(df['time'])
+        # タイムゾーンを日本時間に変換（必要に応じて）
+        if df['time'].dt.tz is not None:
+            df['time'] = df['time'].dt.tz_convert('Asia/Tokyo').dt.tz_localize(None)
+        
+        # 2. 速度・時間差・方位角の計算
+        df['time_diff'] = df['time'].diff().dt.total_seconds()
+        
+        speeds = [0.0]
+        bearings = [0.0]
+        
+        for i in range(1, len(df)):
+            p1 = (df.loc[i-1, 'lat'], df.loc[i-1, 'lon'])
+            p2 = (df.loc[i, 'lat'], df.loc[i, 'lon'])
+            t_diff = df.loc[i, 'time_diff']
             
-            if time_diff > 0:
-                speed = distance_km / time_diff
+            if t_diff > 0:
+                dist = geodesic(p1, p2).meters
+                speed_kmh = (dist / t_diff) * 3.6
+                speeds.append(speed_kmh)
+                
+                # 方位角計算
+                brng = calculate_bearing(p1[0], p1[1], p2[0], p2[1])
+                bearings.append(brng)
             else:
-                speed = 0
+                speeds.append(0.0)
+                bearings.append(bearings[-1] if bearings else 0.0)
+                
+        df['speed'] = speeds
+        df['bearing'] = bearings
+        
+        # 3. データの平滑化（ノイズ除去）
+        df = df[df['speed'] < speed_max_limit].reset_index(drop=True)
+        df['speed_smooth'] = df['speed'].rolling(window=3, min_periods=1).mean()
+        
+        # 4. 特徴量の計算（方位角の変化量など）
+        # 短時間（例: 5秒間）での方位角の変化量を算出
+        df['bearing_diff'] = df['bearing'].diff().abs()
+        df['bearing_diff'] = df['bearing_diff'].map(lambda x: 360 - x if x > 180 else x) # 回り込み補正
+        df['turn_cum'] = df['bearing_diff'].rolling(window=5, min_periods=1).sum()
+
+    # --- 高度な分析ロジック ---
+    
+    # ① フォイリング率
+    foiling_df = df[df['speed_smooth'] >= foil_threshold]
+    foiling_ratio = (len(foiling_df) / len(df)) * 100 if len(df) > 0 else 0
+    
+    # ② 直線での沈（ワイプアウト）
+    # 条件：方位角の変化が小さく（直線）、3秒間で時速12km以上急減速し、最終的に5km/h以下になった箇所
+    df['speed_drop'] = df['speed_smooth'].diff(periods=3) * -1
+    wipeouts = df[
+        (df['speed_drop'] > 12) & 
+        (df['speed_smooth'] < 5) & 
+        (df['turn_cum'] < 45)  # ターン中ではない
+    ]
+    
+    # ③ ジャイブ（ターン）の成功・失敗判定
+    # 条件：5秒間で方位角が70度以上変わった場所を「ターン」と認識
+    turns = df[df['turn_cum'] > 70]
+    
+    jibe_success_points = []
+    jibe_fail_points = []
+    
+    # 連続したターンポイントをグループ化して1回のジャイブイベントとする
+    if not turns.empty:
+        turns = turns.copy()
+        turns['group'] = (turns['time'].diff().dt.total_seconds() > 10).cumsum()
+        
+        for g_id, group in turns.groupby('group'):
+            # ターンイベント中の最低速度を調査
+            min_speed_in_turn = group['speed_smooth'].min()
+            center_idx = group.index[len(group) // 2]
+            point_info = df.loc[center_idx]
             
-            speeds.append(speed)
-    
-    df['speed'] = speeds
-    
-    # 異常値を修正（移動速度が100km/h以上の場合は前値を使用）
-    df.loc[df['speed'] > 100, 'speed'] = df['speed'].shift(1)
-    
-    # ジャイブ（ベクトル前後20本の角度差）と沈を検出
-    jibes, jibes_failed = detect_jibes_by_turn(df, angle_threshold=120.0, window_size=20)
-    crashes = detect_crashes(df, elevation_threshold=0.3)
-    # 速度低下による沈も検出（5 km/h閾値、継続10秒）
-    speed_crashes = detect_speed_drop_crashes(df, speed_threshold=5.0, sustained_seconds=10)
-    if speed_crashes:
-        crashes.extend(speed_crashes)
-
-    # ジャイブ成功率を計算（失敗率ベース）
-    total_jibes = len(jibes)
-    failed_jibes = len(jibes_failed)
-    if total_jibes > 0:
-        jibe_success_rate = max(0.0, min(100.0, (1.0 - (failed_jibes / total_jibes)) * 100.0))
-    else:
-        jibe_success_rate = 100.0
-    
-    # 速度統計
-    avg_speed = df['speed'].mean()
-    max_speed = df['speed'].max()
-    min_speed = df['speed'].min()
-    
-    # 左右に分割したレイアウト
-    col_map, col_stats = st.columns([3, 1])
-    
-    with col_map:
-        st.subheader("🗺️ トラック地図 (速度色分け)")
-        
-        # 地図作成
-        center_lat = df['latitude'].mean()
-        center_lon = df['longitude'].mean()
-        m = folium.Map(
-            location=[center_lat, center_lon],
-            zoom_start=13,
-            tiles="OpenStreetMap"
-        )
-        
-        # 速度に基づいて軌跡を描画
-        vmin, vmax = df['speed'].min(), 20.0
-        for i in range(len(df) - 1):
-            color = get_speed_color(df['speed'].iloc[i], vmin, vmax)
-            
-            folium.PolyLine(
-                locations=[
-                    (df['latitude'].iloc[i], df['longitude'].iloc[i]),
-                    (df['latitude'].iloc[i+1], df['longitude'].iloc[i+1])
-                ],
-                color=color,
-                weight=3,
-                opacity=0.8,
-                popup=f"Speed: {df['speed'].iloc[i]:.1f} km/h"
-            ).add_to(m)
-        
-        # スタート地点（緑）
-        folium.CircleMarker(
-            location=(df['latitude'].iloc[0], df['longitude'].iloc[0]),
-            radius=8,
-            popup="🟢 Start",
-            color='green',
-            fill=True,
-            fillColor='green',
-            fillOpacity=0.9,
-            weight=2
-        ).add_to(m)
-        
-        # ゴール地点（青）
-        folium.CircleMarker(
-            location=(df['latitude'].iloc[-1], df['longitude'].iloc[-1]),
-            radius=8,
-            popup="🔵 Finish",
-            color='blue',
-            fill=True,
-            fillColor='blue',
-            fillOpacity=0.9,
-            weight=2
-        ).add_to(m)
-        
-        # ジャイブの進入（赤）/脱出（緑）区間を太線で描画
-        failed_end_idxs = set([e['end_index'] for e in jibes_failed])
-        for j in jibes:
-            is_failed = j['end_index'] in failed_end_idxs
-
-            # 進入部分（赤）
-            in_start = max(0, j.get('in_start', j['start_index']))
-            in_end = min(len(df) - 1, j.get('in_end', j['start_index']))
-            if in_end > in_start:
-                folium.PolyLine(
-                    locations=[(df['latitude'].iloc[i], df['longitude'].iloc[i]) for i in range(in_start, in_end + 1)],
-                    color='red',
-                    weight=8,
-                    opacity=0.9
-                ).add_to(m)
-
-            # 脱出部分（緑）
-            out_start = max(0, j.get('out_start', j['start_index']))
-            out_end = min(len(df) - 1, j.get('out_end', j['end_index']))
-            if out_end > out_start:
-                folium.PolyLine(
-                    locations=[(df['latitude'].iloc[i], df['longitude'].iloc[i]) for i in range(out_start, out_end + 1)],
-                    color='green',
-                    weight=8,
-                    opacity=0.9
-                ).add_to(m)
-
-        # ジャイブ（角度ベース）のマーク（成功:緑, 失敗:オレンジ）
-        for j in jibes:
-            idx = j['end_index']
-            is_failed = idx in failed_end_idxs
-            color = 'orange' if is_failed else 'green'
-            folium.CircleMarker(
-                location=(df['latitude'].iloc[idx], df['longitude'].iloc[idx]),
-                radius=6,
-                popup=f"{'❌' if is_failed else '✅'} Jibe<br>Angle: {j['angle_deg']:.0f}°<br>Duration: {j['duration_s']:.1f}s<br>Direction: {j['direction']}",
-                color=color,
-                fill=True,
-                fillColor=color,
-                fillOpacity=0.9,
-                weight=1
-            ).add_to(m)
-
-        # 沈マーク（赤の✘）
-        for crash in crashes:
-            if crash.get('crash_type') == 'speed_drop':
-                popup_text = (
-                    f"💧 Crash (speed drop)<br>Prior run: {crash['prior_duration_s']:.0f}s @ ≥5 km/h<br>"
-                    f"Dropped below 5 km/h at {crash['time']}"
-                )
+            if min_speed_in_turn >= jibe_speed_threshold:
+                jibe_success_points.append(point_info)
             else:
-                popup_text = (
-                    f"💧 Crash<br>Elevation Loss: {crash['elevation_loss']:.1f}m<br>"
-                    f"Before: {crash['elevation_before']:.1f}m → After: {crash['elevation_after']:.1f}m"
-                )
+                jibe_fail_points.append(point_info)
+                
+    js_df = pd.DataFrame(jibe_success_points)
+    jf_df = pd.DataFrame(jibe_fail_points)
+    
+    total_jibes = len(js_df) + len(jf_df)
+    jibe_success_ratio = (len(js_df) / total_jibes) * 100 if total_jibes > 0 else 0
 
-            folium.Marker(
-                location=(crash['latitude'], crash['longitude']),
-                popup=popup_text,
-                icon=folium.Icon(color='red', icon='times', prefix='fa', icon_color='white')
-            ).add_to(m)
+    # --- UI表示エリア ---
+    
+    # ダッシュボード統計（4列）
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("🚀 最高速度", f"{df['speed_smooth'].max():.1f} km/h")
+    col2.metric("📊 推定フォイリング率", f"{foiling_ratio:.1f} %")
+    col3.metric("🔄 ジャイブ成功率", f"{jibe_success_ratio:.1f} %", f"成功:{len(js_df)} / 全体:{total_jibes}")
+    col4.metric("⚠️ 直線での沈回数", f"{len(wipeouts)} 回")
+    
+    st.markdown("---")
+    
+    # メインレイアウト（地図とグラフを左右に並べる）
+    left_col, right_col = st.columns([6, 4])
+    
+    with left_col:
+        st.subheader("🗺️ セッションマップ")
         
-        # カラーバーを追加
-        colormap = folium.LinearColormap(
-            colors=['#0000ff', '#00ffff', '#ffff00', '#ff0000'],
-            vmin=vmin,
-            vmax=vmax,
-            caption='Speed (km/h)'
+        # Plotly Mapboxによる地図描画
+        fig_map = go.Figure()
+        
+        # 走行軌跡
+        fig_map.add_trace(go.Scattermapbox(
+            lat=df['lat'], lon=df['lon'],
+            mode='lines',
+            line=dict(width=3, color='#1f77b4'),
+            name='走行軌跡',
+            hoverinfo='text',
+            text=df['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
+        ))
+        
+        # 直線での沈ポイント
+        if not wipeouts.empty:
+            fig_map.add_trace(go.Scattermapbox(
+                lat=wipeouts['lat'], lon=wipeouts['lon'],
+                mode='markers',
+                marker=dict(size=12, color='red', symbol='cross'),
+                name='直線での沈 (Wipeout)'
+            ))
+            
+        # ジャイブ成功ポイント
+        if not js_df.empty:
+            fig_map.add_trace(go.Scattermapbox(
+                lat=js_df['lat'], lon=js_df['lon'],
+                mode='markers',
+                marker=dict(size=10, color='green', symbol='circle'),
+                name='ジャイブ成功'
+            ))
+            
+        # ジャイブ失敗ポイント
+        if not jf_df.empty:
+            fig_map.add_trace(go.Scattermapbox(
+                lat=jf_df['lat'], lon=jf_df['lon'],
+                mode='markers',
+                marker=dict(size=10, color='orange', symbol='circle'),
+                name='ジャイブ失速/失敗'
+            ))
+            
+        # マップのレイアウト設定
+        fig_map.update_layout(
+            mapbox=dict(
+                style="open-street-map",
+                center=dict(lat=df['lat'].mean(), lon=df['lon'].mean()),
+                zoom=14
+            ),
+            margin={"r":0,"t":0,"l":0,"b":0},
+            height=550,
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(255,255,255,0.8)")
         )
-        colormap.add_to(m)
+        st.plotly_chart(fig_map, use_container_width=True)
         
-        st_folium(m, width=1000, height=600)
-    
-    with col_stats:
-        st.subheader("📊 統計情報")
-        st.metric("✅ Jibe成功率", f"{jibe_success_rate:.0f}%")
-        st.metric("📈 平均速度", f"{avg_speed:.1f} km/h")
-        st.metric("⚡ 最高速度", f"{max_speed:.1f} km/h")
-        st.metric("🚫 ジャイブ失敗", len(jibes_failed))
-        st.metric("💧 沈", len(crashes))
-        st.metric("⏱️ セッション時間", f"{len(df)} points")
-    
-    # 詳細分析タブ
-    st.divider()
-    tab2, tab3, tab4 = st.tabs(["❌ ジャイブ失敗", "💧 沈", "📈 速度グラフ"])
-    
-    with tab2:
-        st.subheader("🌀 ジャイブの詳細")
-        if total_jibes > 0:
-            jibes_df = pd.DataFrame(jibes)
-            jibes_df['start_time'] = jibes_df['start_time']
-            jibes_df['end_time'] = jibes_df['end_time']
-            st.dataframe(jibes_df[['start_time', 'end_time', 'duration_s', 'angle_deg', 'direction']], use_container_width=True)
-            st.info(f"合計 {total_jibes} 回のジャイブを検出しました（失敗: {failed_jibes}）")
-        else:
-            st.success("🎉 ジャイブなし！完璧なセッションです！")
-    
-    with tab3:
-        st.subheader("沈の詳細")
-        if crashes:
-            crashes_df = pd.DataFrame(crashes)
-            st.dataframe(crashes_df[['time', 'elevation_before', 'elevation_after', 'elevation_loss']], use_container_width=True)
-            st.info(f"合計 {len(crashes)} 回の沈を検出しました")
-        else:
-            st.success("🎉 沈なし！素晴らしいセッションです！")
-    
-    with tab4:
-        st.subheader("速度の時系列グラフ")
-        fig, ax = plt.subplots(figsize=(12, 4))
-        ax.plot(range(len(df)), df['speed'], linewidth=2, color='#1f77b4')
-        ax.fill_between(range(len(df)), df['speed'], alpha=0.3, color='#1f77b4')
-        ax.set_xlabel("Time Point")
-        ax.set_ylabel("Speed (km/h)")
-        ax.set_title("Speed Profile")
-        ax.grid(True, alpha=0.3)
-        st.pyplot(fig)
+    with right_col:
+        st.subheader("📈 タイムライン分析")
+        
+        # 速度の推移グラフ
+        fig_speed = px.line(
+            df, x='time', y='speed_smooth',
+            title="速度推移 (km/h)",
+            labels={'speed_smooth': '速度 (km/h)', 'time': '時刻'}
+        )
+        # フォイリング閾値の基準線を引く
+        fig_speed.add_hline(y=foil_threshold, line_dash="dash", line_color="red", annotation_text="フォイリング閾値")
+        fig_speed.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
+        st.plotly_chart(fig_speed, use_container_width=True)
+        
+        # 進行方向（方位角）の推移グラフ
+        fig_bearing = px.line(
+            df, x='time', y='bearing',
+            title="進行方向（方位/0-360度）",
+            labels={'bearing': '方位角 (度)', 'time': '時刻'}
+        )
+        fig_bearing.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
+        st.plotly_chart(fig_bearing, use_container_width=True)
+
+    # ログデータのチラ見せ（デバッグ用）
+    with st.expander("📂 解析データテーブルの表示"):
+        st.dataframe(df[['time', 'speed_smooth', 'bearing', 'turn_cum']].head(100))
+
 else:
-    st.info("👆 GPXファイルをアップロードして開始してください")
+    st.info("👆 上記のエリアにスマートウォッチやGPSロガーから出力したGPXファイルをアップロードしてください。")
