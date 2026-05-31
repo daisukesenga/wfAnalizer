@@ -17,15 +17,15 @@ foil_threshold = st.sidebar.slider("フォイリング開始速度 (km/h)", 0.0,
 jibe_speed_threshold = st.sidebar.slider("ジャイブ成功とみなす最低速度 (km/h)", 0.0, 20.0, 11.0, 0.5)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔄 ジャイブ誤判定防止チューニング")
-jibe_min_distance = st.sidebar.slider("ジャイブ判定距離の最低値 (m)", 5, 99, 15, 1)
-jibe_min_angle = st.sidebar.slider("ジャイブ判定角度の最小値 (度)", 90, 270, 120, 5)
+st.sidebar.subheader("🔄 ジャイブ（ターン）判定設定")
+# 💡 意味合いを「これ以上曲がっていたらジャイブ」に変更（扱いやすいよう30度〜120度へ調整）
+jibe_turn_angle_threshold = st.sidebar.slider("直線とみなす最大角度（度）", 10, 120, 45, 5,
+                                              help="この角度以下しか曲がっていない区間を『直線』とみなします。これを超えて曲がっている区間はすべてジャイブになります。")
 
-# 💡 スムージングの強度をユーザーが調整できるようにパラメータを追加
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧼 スムージング（ノイズ除去）設定")
-smoothing_window = st.sidebar.slider("軌跡の平滑化強度 (データ点数)", 1, 10, 5, 1, 
-                                    help="値を大きくするとガタガタが減りますが、急なターンの角が丸くなります。通常は3〜5がおすすめです。")
+smoothing_window = st.sidebar.slider("軌跡の平滑化強度 (データ点数)", 1, 15, 7, 1, 
+                                    help="値を大きくするとガタガタが減ります。直線判定を安定させるため、5〜9などの少し大きめの値がおすすめです。")
 
 speed_max_limit = st.sidebar.number_input("GPSノイズカットの上限速度 (km/h)", 50, 100, 60)
 
@@ -69,7 +69,7 @@ if uploaded_file is not None:
         if df['time'].dt.tz is not None:
             df['time'] = df['time'].dt.tz_convert('Asia/Tokyo').dt.tz_localize(None)
         
-        # 💡【位置データのスムージング】緯度・経度そのものを移動平均してガタガタ線を修正
+        # 【位置データのスムージング】
         if smoothing_window > 1:
             df['lat'] = df['lat'].rolling(window=smoothing_window, min_periods=1, center=True).mean()
             df['lon'] = df['lon'].rolling(window=smoothing_window, min_periods=1, center=True).mean()
@@ -101,15 +101,16 @@ if uploaded_file is not None:
         
         # 3. データの平滑化（ノイズ除去）
         df = df[df['speed'] < speed_max_limit].reset_index(drop=True)
-        # 💡【速度のスムージング】速度グラフや判定ロジック用の速度も平滑化
         df['speed_smooth'] = df['speed'].rolling(window=smoothing_window, min_periods=1, center=True).mean()
         
-        # 4. 特徴量の計算（方位角の変化量など）
+        # 4. 特徴量の計算（方位角の変化量）
         df['bearing_diff'] = df['bearing'].diff().abs()
         df['bearing_diff'] = df['bearing_diff'].map(lambda x: 360 - x if x > 180 else x)
+        
+        # 5秒間の累積方向変化
         df['turn_cum'] = df['bearing_diff'].rolling(window=5, min_periods=1).sum()
 
-    # --- 高度な分析ロジック ---
+    # --- 🔄 刷新されたジャイブ判定ロジック ---
     
     # ① フォイリング率
     foiling_df = df[df['speed_smooth'] >= foil_threshold]
@@ -120,53 +121,34 @@ if uploaded_file is not None:
     wipeouts = df[
         (df['speed_drop'] > 12) & 
         (df['speed_smooth'] < 5) & 
-        (df['turn_cum'] < 45)
+        (df['turn_cum'] < jibe_turn_angle_threshold)
     ]
     
-    # ③ ジャイブ（ターン）の成功・失敗判定とグループ化
-    turns_candidate = df[df['turn_cum'] > 60]
+    # ③ 新ジャイブ判定：
+    # 「5秒間の方向変化が指定角度より大きい区間」＝ジャイブ（ターン）区間とする
+    jibe_zone = df[df['turn_cum'] > jibe_turn_angle_threshold]
     
     jibe_success_count = 0
     jibe_fail_count = 0
     valid_turn_indices = [] 
     
-    if not turns_candidate.empty:
-        turns_candidate = turns_candidate.copy()
-        turns_candidate['group'] = (turns_candidate['time'].diff().dt.total_seconds() > 10).cumsum()
+    if not jibe_zone.empty:
+        jibe_zone = jibe_zone.copy()
+        # 連続したターンポイント（10秒以内）を1つのイベントにグループ化
+        jibe_zone['group'] = (jibe_zone['time'].diff().dt.total_seconds() > 10).cumsum()
         
-        for g_id, group in turns_candidate.groupby('group'):
+        for g_id, group in jibe_zone.groupby('group'):
             entry_idx = group.index.min()
-            exit_idx = group.index.max()
             
-            # 1. フォイリング中からの進入かチェック
+            # 💡 フォイリング中（あるいはフォイリング直前）のアクションのみに対象を絞る場合
             entry_speed = df.loc[entry_idx, 'speed_smooth']
             if entry_speed < foil_threshold:
                 continue
                 
-            # 2. 【距離の判定】
-            segment_dist = 0
-            for idx in range(entry_idx + 1, exit_idx + 1):
-                p1 = (df.loc[idx-1, 'lat'], df.loc[idx-1, 'lon'])
-                p2 = (df.loc[idx, 'lat'], df.loc[idx, 'lon'])
-                segment_dist += geodesic(p1, p2).meters
-                
-            if segment_dist < jibe_min_distance:
-                continue 
-                
-            # 3. 【角度の判定】
-            entry_bearing = df.loc[max(0, entry_idx - 2), 'bearing'] 
-            exit_bearing = df.loc[min(len(df)-1, exit_idx + 2), 'bearing']  
-            
-            net_angle_diff = abs(exit_bearing - entry_bearing)
-            if net_angle_diff > 180:
-                net_angle_diff = 360 - net_angle_diff 
-                
-            if net_angle_diff < jibe_min_angle:
-                continue 
-                
-            # 条件をクリアした場合のみ認定
             valid_turn_indices.extend(group.index.tolist())
             
+            # 💡【成否判定のシンプル化】
+            # ジャイブ中（グループ内）の最低速度が、設定した最低速度を上回っていたら成功、それ以外は失敗
             min_speed_in_turn = group['speed_smooth'].min()
             if min_speed_in_turn >= jibe_speed_threshold:
                 jibe_success_count += 1
@@ -191,7 +173,7 @@ if uploaded_file is not None:
     left_col, right_col = st.columns([6, 4])
     
     with left_col:
-        st.subheader("🗺️ セッションマップ（ジャイブ成否のライン色分け）")
+        st.subheader("🗺️ セッションマップ（ターン区間の成否色分け）")
         
         fig_map = go.Figure()
         
@@ -205,7 +187,7 @@ if uploaded_file is not None:
             text=df['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
         ))
         
-        # --- 2. 精密判定されたジャイブ軌跡の描画 ---
+        # --- 2. 判定されたジャイブ軌跡の描画 ---
         if not valid_turns.empty:
             success_legend_done = False
             fail_legend_done = False
@@ -238,7 +220,7 @@ if uploaded_file is not None:
                     name=line_name,
                     showlegend=show_legend,
                     hoverinfo='text',
-                    text=turn_segment['speed_smooth'].map(lambda x: f"ターン中 速度: {x:.1f} km/h")
+                    text=turn_segment['speed_smooth'].map(lambda x: f"ターン中 最低速度: {min_speed_in_turn:.1f} km/h")
                 ))
         
         # --- 3. 直線での沈（ワイプアウト）ポイント ---
