@@ -95,4 +95,147 @@ if uploaded_file is not None:
     
     # ① フォイリング率
     foiling_df = df[df['speed_smooth'] >= foil_threshold]
-    foiling_ratio = (len(fo
+    foiling_ratio = (len(foiling_df) / len(df)) * 100 if len(df) > 0 else 0
+    
+    # ② 直線での沈（ワイプアウト）
+    df['speed_drop'] = df['speed_smooth'].diff(periods=3) * -1
+    wipeouts = df[
+        (df['speed_drop'] > 12) & 
+        (df['speed_smooth'] < 5) & 
+        (df['turn_cum'] < 45)
+    ]
+    
+    # ③ ジャイブ（ターン）の成功・失敗判定とグループ化
+    turns = df[df['turn_cum'] > 70]
+    
+    jibe_success_count = 0
+    jibe_fail_count = 0
+    
+    if not turns.empty:
+        turns = turns.copy()
+        # 連続したターンポイント（10秒以内）を1つのジャイブイベントとしてグループ化
+        turns['group'] = (turns['time'].diff().dt.total_seconds() > 10).cumsum()
+        
+        for g_id, group in turns.groupby('group'):
+            min_speed_in_turn = group['speed_smooth'].min()
+            if min_speed_in_turn >= jibe_speed_threshold:
+                jibe_success_count += 1
+            else:
+                jibe_fail_count += 1
+                
+    total_jibes = jibe_success_count + jibe_fail_count
+    jibe_success_ratio = (jibe_success_count / total_jibes) * 100 if total_jibes > 0 else 0
+
+    # --- UI表示エリア ---
+    
+    # ダッシュボード統計（4列）
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("🚀 最高速度", f"{df['speed_smooth'].max():.1f} km/h")
+    col2.metric("📊 推定フォイリング率", f"{foiling_ratio:.1f} %")
+    col3.metric("🔄 ジャイブ成功率", f"{jibe_success_ratio:.1f} %", f"成功:{jibe_success_count} / 全体:{total_jibes}")
+    col4.metric("⚠️ 直線での沈回数", f"{len(wipeouts)} 回")
+    
+    st.markdown("---")
+    
+    # メインレイアウト（地図とグラフを左右に並べる）
+    left_col, right_col = st.columns([6, 4])
+    
+    with left_col:
+        st.subheader("🗺️ セッションマップ（ジャイブ成否のライン色分け）")
+        
+        fig_map = go.Figure()
+        
+        # --- 1. 通常の走行軌跡（ベースの細いグレー線） ---
+        fig_map.add_trace(go.Scattermapbox(
+            lat=df['lat'], lon=df['lon'],
+            mode='lines',
+            line=dict(width=2, color='#A0AEC0'), 
+            name='通常走行',
+            hoverinfo='text',
+            text=df['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
+        ))
+        
+        # --- 2. ジャイブ成功・失敗の軌跡を太いカラーラインで描画 ---
+        if not turns.empty:
+            success_legend_done = False
+            fail_legend_done = False
+            
+            for g_id, group in turns.groupby('group'):
+                # 前後のつながりをスムーズにするため、マージンとして前後3データ点分を含めて切り出す
+                start_idx = max(0, group.index.min() - 3)
+                end_idx = min(len(df) - 1, group.index.max() + 3)
+                turn_segment = df.loc[start_idx:end_idx]
+                
+                min_speed_in_turn = group['speed_smooth'].min()
+                
+                if min_speed_in_turn >= jibe_speed_threshold:
+                    line_color = '#2ECC71'  # 成功：鮮やかな緑
+                    line_name = 'ジャイブ成功区間'
+                    show_legend = not success_legend_done
+                    success_legend_done = True
+                else:
+                    line_color = '#E74C3C'  # 失敗：鮮やかな赤
+                    line_name = 'ジャイブ失敗区間'
+                    show_legend = not fail_legend_done
+                    fail_legend_done = True
+                
+                fig_map.add_trace(go.Scattermapbox(
+                    lat=turn_segment['lat'], lon=turn_segment['lon'],
+                    mode='lines',
+                    line=dict(width=5, color=line_color),  # ターン区間は太さ5
+                    name=line_name,
+                    showlegend=show_legend,                # 凡例の重複防止
+                    hoverinfo='text',
+                    text=turn_segment['speed_smooth'].map(lambda x: f"ターン中 速度: {x:.1f} km/h")
+                ))
+        
+        # --- 3. 直線での沈（ワイプアウト）ポイント ---
+        if not wipeouts.empty:
+            fig_map.add_trace(go.Scattermapbox(
+                lat=wipeouts['lat'], lon=wipeouts['lon'],
+                mode='markers',
+                marker=dict(size=12, color='black', symbol='cross'), # 目立つ黒の×印
+                name='直線での沈 (Wipeout)'
+            ))
+            
+        # マップのレイアウト設定
+        fig_map.update_layout(
+            mapbox=dict(
+                style="open-street-map",
+                center=dict(lat=df['lat'].mean(), lon=df['lon'].mean()),
+                zoom=14
+            ),
+            margin={"r":0,"t":0,"l":0,"b":0},
+            height=550,
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(255,255,255,0.8)")
+        )
+        st.plotly_chart(fig_map, use_container_width=True)
+        
+    with right_col:
+        st.subheader("📈 タイムライン分析")
+        
+        # 速度の推移グラフ
+        fig_speed = px.line(
+            df, x='time', y='speed_smooth',
+            title="速度推移 (km/h)",
+            labels={'speed_smooth': '速度 (km/h)', 'time': '時刻'}
+        )
+        fig_speed.add_hline(y=foil_threshold, line_dash="dash", line_color="red", annotation_text="フォイリング閾値")
+        fig_speed.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
+        st.plotly_chart(fig_speed, use_container_width=True)
+        
+        # 進行方向（方位角）の推移グラフ
+        fig_bearing = px.line(
+            df, x='time', y='bearing',
+            title="進行方向（方位/0-360度）",
+            labels={'bearing': '方位角 (度)', 'time': '時刻'}
+        )
+        fig_bearing.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
+        st.plotly_chart(fig_bearing, use_container_width=True)
+
+    # ログデータの表示
+    with st.expander("📂 解析データテーブルの表示"):
+        st.dataframe(df[['time', 'speed_smooth', 'bearing', 'turn_cum']].head(100))
+
+else:
+    st.info("👆 上記のエリアにスマートウォッチやGPSロガーから出力したGPXファイルをアップロードしてください。")
