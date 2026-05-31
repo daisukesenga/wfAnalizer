@@ -1,72 +1,98 @@
-st.subheader("🗺️ セッションマップ（ジャイブ成否のライン色分け）")
+import streamlit as st
+import gpxpy
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from geopy.distance import geodesic
+
+# ページの設定
+st.set_page_config(page_title="Wing Foil GPX Analyzer", layout="wide")
+st.title("🏄‍♂️ ウィングフォイル GPXアナライザー")
+st.write("GPXファイルをアップロードして、フォイリング率、ジャイブ成功率、沈（ワイプアウト）ポイントを分析します。")
+
+# --- サイドバーの設定 ---
+st.sidebar.header("⚙️ 解析パラメータ設定")
+foil_threshold = st.sidebar.slider("フォイリング開始速度 (km/h)", 10.0, 18.0, 13.5, 0.5)
+jibe_speed_threshold = st.sidebar.slider("ジャイブ成功とみなす最低速度 (km/h)", 8.0, 15.0, 11.0, 0.5)
+speed_max_limit = st.sidebar.number_input("GPSノイズカットの上限速度 (km/h)", 50, 100, 60)
+
+# --- 方位角（Heading）を計算する関数 ---
+def calculate_bearing(lat1, lon1, lat2, lon2):
+    lat1_rad = np.radians(lat1)
+    lat2_rad = np.radians(lat2)
+    delta_lon = np.radians(lon2 - lon1)
+    
+    y = np.sin(delta_lon) * np.cos(lat2_rad)
+    x = np.cos(lat1_rad) * np.sin(lat2_rad) - np.sin(lat1_rad) * np.cos(lat2_rad) * np.cos(delta_lon)
+    
+    bearing = np.degrees(np.arctan2(y, x))
+    return (bearing + 360) % 360
+
+# --- ファイルアップローダー ---
+uploaded_file = st.file_uploader("GPXファイルをドラッグ＆ドロップ、またはブラウズ", type=["gpx"])
+
+if uploaded_file is not None:
+    # 1. GPXデータのパース
+    with st.spinner("GPXファイルを解析中..."):
+        gpx = gpxpy.parse(uploaded_file)
+        raw_data = []
         
-        fig_map = go.Figure()
-        
-        # --- 1. 通常の走行軌跡（ベースの線） ---
-        fig_map.add_trace(go.Scattermapbox(
-            lat=df['lat'], lon=df['lon'],
-            mode='lines',
-            line=dict(width=2, color='#A0AEC0'), # 目立ちすぎないグレー
-            name='通常走行',
-            hoverinfo='text',
-            text=df['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
-        ))
-        
-        # --- 2. ジャイブ成功・失敗の軌跡をラインで強調 ---
-        # 連続したターンポイント（group）ごとに、その区間のラインを描画する
-        if not turns.empty:
-            for g_id, group in turns.groupby('group'):
-                # ターンの前後のマージンを取るため、インデックスを少し広げる（前後3データ点分）
-                start_idx = max(0, group.index.min() - 3)
-                end_idx = min(len(df) - 1, group.index.max() + 3)
-                turn_segment = df.loc[start_idx:end_idx]
-                
-                # このターンが成功か失敗か判定
-                min_speed_in_turn = group['speed_smooth'].min()
-                
-                if min_speed_in_turn >= jibe_speed_threshold:
-                    # ジャイブ成功：緑のライン
-                    line_color = '#2ECC71' # 鮮やかな緑
-                    line_name = 'ジャイブ成功区間'
-                    show_legend = True if 'success_legend_done' not in locals() else False
-                    success_legend_done = True
-                else:
-                    # ジャイブ失敗：赤のライン
-                    line_color = '#E74C3C' # 鮮やかな赤
-                    line_name = 'ジャイブ失敗区間'
-                    show_legend = True if 'fail_legend_done' not in locals() else False
-                    fail_legend_done = True
-                
-                # マップに区間線を追加
-                fig_map.add_trace(go.Scattermapbox(
-                    lat=turn_segment['lat'], lon=turn_segment['lon'],
-                    mode='lines',
-                    line=dict(width=5, color=line_color), # ターンは太い線にする
-                    name=line_name,
-                    showlegend=show_legend, # 凡例が大量に出るのを防ぐ
-                    hoverinfo='text',
-                    text=turn_segment['speed_smooth'].map(lambda x: f"ターン中 速度: {x:.1f} km/h")
-                ))
-        
-        # --- 3. 直線での沈（ワイプアウト）ポイント ---
-        # （※ご要望は「緑と黄のプロットは不要」でしたので、直線沈の赤クロスだけ残しています。不要ならここも削除可能です）
-        if not wipeouts.empty:
-            fig_map.add_trace(go.Scattermapbox(
-                lat=wipeouts['lat'], lon=wipeouts['lon'],
-                mode='markers',
-                marker=dict(size=12, color='black', symbol='cross'), # 目立つように黒の×に
-                name='直線での沈 (Wipeout)'
-            ))
+        for track in gpx.tracks:
+            for segment in track.segments:
+                for point in segment.points:
+                    raw_data.append({
+                        "time": point.time,
+                        "lat": point.latitude,
+                        "lon": point.longitude
+                    })
+                    
+        if len(raw_data) < 10:
+            st.error("データポイントが少なすぎます。正しいGPXファイルか確認してください。")
+            st.stop()
             
-        # マップのレイアウト設定
-        fig_map.update_layout(
-            mapbox=dict(
-                style="open-street-map",
-                center=dict(lat=df['lat'].mean(), lon=df['lon'].mean()),
-                zoom=14
-            ),
-            margin={"r":0,"t":0,"l":0,"b":0},
-            height=550,
-            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(255,255,255,0.8)")
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
+        df = pd.DataFrame(raw_data)
+        df['time'] = pd.to_datetime(df['time'])
+        
+        if df['time'].dt.tz is not None:
+            df['time'] = df['time'].dt.tz_convert('Asia/Tokyo').dt.tz_localize(None)
+        
+        # 2. 速度・時間差・方位角の計算
+        df['time_diff'] = df['time'].diff().dt.total_seconds()
+        
+        speeds = [0.0]
+        bearings = [0.0]
+        
+        for i in range(1, len(df)):
+            p1 = (df.loc[i-1, 'lat'], df.loc[i-1, 'lon'])
+            p2 = (df.loc[i, 'lat'], df.loc[i, 'lon'])
+            t_diff = df.loc[i, 'time_diff']
+            
+            if t_diff > 0:
+                dist = geodesic(p1, p2).meters
+                speed_kmh = (dist / t_diff) * 3.6
+                speeds.append(speed_kmh)
+                
+                brng = calculate_bearing(p1[0], p1[1], p2[0], p2[1])
+                bearings.append(brng)
+            else:
+                speeds.append(0.0)
+                bearings.append(bearings[-1] if bearings else 0.0)
+                
+        df['speed'] = speeds
+        df['bearing'] = bearings
+        
+        # 3. データの平滑化（ノイズ除去）
+        df = df[df['speed'] < speed_max_limit].reset_index(drop=True)
+        df['speed_smooth'] = df['speed'].rolling(window=3, min_periods=1).mean()
+        
+        # 4. 特徴量の計算（方位角の変化量など）
+        df['bearing_diff'] = df['bearing'].diff().abs()
+        df['bearing_diff'] = df['bearing_diff'].map(lambda x: 360 - x if x > 180 else x)
+        df['turn_cum'] = df['bearing_diff'].rolling(window=5, min_periods=1).sum()
+
+    # --- 高度な分析ロジック ---
+    
+    # ① フォイリング率
+    foiling_df = df[df['speed_smooth'] >= foil_threshold]
+    foiling_ratio = (len(fo
