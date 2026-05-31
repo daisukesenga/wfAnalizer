@@ -155,7 +155,7 @@ if uploaded_file is not None:
     # 【ステップ2】直線フォイリング中を一時的にマーク（内部計算用）
     df.loc[(df['segment_type'] == 'normal') & (df['is_straight']) & (df['is_foiling']), 'segment_type'] = 'straight_internal'
 
-    # 【ステップ3】「直線からの沈」を検出し、その減速区間を赤線化する
+    # 【ステップ3】「直線からの沈」を検出し、その減速区間をマーク
     wipeout_count = 0
     wipeout_times = []
     i = 0
@@ -184,7 +184,7 @@ if uploaded_file is not None:
                     if duration >= 10:
                         wipeout_count += 1
                         wipeout_times.append(df.loc[fall_idx, 'time'])
-                        # 💡 着水から完全に失速・停止するまでの区間（10秒間、または次の状態まで）を「沈区間」として赤線化
+                        # 着水から完全に失速・停止するまでの区間を「沈区間」としてマーク
                         end_red_idx = min(fall_idx + 10, k, n - 1)
                         df.loc[fall_idx:end_red_idx, 'segment_type'] = 'wipeout_line'
                     i = k
@@ -193,13 +193,13 @@ if uploaded_file is not None:
         else:
             i += 1
             
-    # マップに黄色を出さないよう、内部用の直線マークを通常（normal）に戻す
+    # 内部用の直線マークを通常（normal）に戻す
     df.loc[df['segment_type'] == 'straight_internal', 'segment_type'] = 'normal'
                 
     total_jibes = jibe_success_count + jibe_fail_count
     jibe_success_ratio = (jibe_success_count / total_jibes) * 100 if total_jibes > 0 else 0
 
-    # --- UI表示エリア （フォイリング率を削除し、3列に変更） ---
+    # --- UI表示エリア ---
     col1, col2, col3 = st.columns(3)
     col1.metric("🚀 最高速度", f"{df['speed_smooth'].max():.1f} km/h")
     col2.metric("🔄 ジャイブ成功率", f"{jibe_success_ratio:.1f} %", f"成功:{jibe_success_count} / 全体:{total_jibes}")
@@ -210,7 +210,7 @@ if uploaded_file is not None:
     left_col, right_col = st.columns([6, 4])
     
     with left_col:
-        st.subheader("🗺️ セッションマップ（成功＝緑 / 失敗＝赤 / 直線沈＝太赤線）")
+        st.subheader("🗺️ セッションマップ（成功＝緑 / 失敗＝赤 / 直線沈＝黄線）")
         
         fig_map = go.Figure()
         
@@ -253,7 +253,7 @@ if uploaded_file is not None:
                 fail_legend = True
                 width = 5
             elif seg_type == 'wipeout_line':
-                color = '#C0392B'  # 💡 直線からの沈：濃い赤の太線
+                color = '#F1C40F'  # 💡 ご要望通り、直線からの沈を「鮮やかな黄色」に変更
                 name = '直線からの沈（落水減速区間）'
                 show_leg = not wipeout_legend
                 wipeout_legend = True
@@ -292,7 +292,6 @@ if uploaded_file is not None:
         fig_speed.add_hline(y=foil_start_threshold, line_dash="dash", line_color="red", annotation_text="開始閾値")
         fig_speed.add_hline(y=foil_end_threshold, line_dash="dot", line_color="orange", annotation_text="終了閾値")
         
-        # 速度グラフ上の沈発生タイミング
         for w_time in wipeout_times:
             fig_speed.add_vline(x=w_time, line_color="black", line_dash="dash")
             
