@@ -68,14 +68,11 @@ if uploaded_file is not None:
         df = pd.DataFrame(raw_data)
         df['time'] = pd.to_datetime(df['time'])
         
-        # 💡 【日本時間（JST）へのローカライズと統一】
-        if df['time'].dt.tz is not None:
-            df['time'] = df['time'].dt.tz_convert('Asia/Tokyo').dt.tz_localize(None)
-        else:
-            # タイムゾーン情報がない（暗黙的にUTCである）場合は、+9時間して日本時間にする
-            df['time'] = df['time'] + pd.Timedelta(hours=9)
-            
-        # グラフ表示用に文字列フォーマットした日本時間カラムを作成
+        # 💡 【時間の補正を撤廃】
+        # ファイル内の時刻がすでに日本時間なので、タイムゾーン情報を剥ぎ取って純粋なローカル時間として扱います
+        df['time'] = df['time'].dt.tz_localize(None)
+        
+        # 表示用の文字列フォーマット
         df['time_jst_str'] = df['time'].dt.strftime('%H:%M:%S')
         
         # 【位置データのスムージング】
@@ -235,14 +232,13 @@ if uploaded_file is not None:
         fig_map = go.Figure()
         
         # --- 1. ベースの通常走行軌跡（グレー） ---
-        # 💡 hoverinfoの表示テキストに日本時間（JST）を組み込みました
         fig_map.add_trace(go.Scattermapbox(
             lat=df['lat'], lon=df['lon'],
             mode='lines',
             line=dict(width=2, color='#A0AEC0'), 
             name='通常走行（直線含む）',
             hoverinfo='text',
-            text=df.apply(lambda row: f"時刻(JST): {row['time_jst_str']}<br>速度: {row['speed_smooth']:.1f} km/h", axis=1)
+            text=df.apply(lambda row: f"時刻: {row['time_jst_str']}<br>速度: {row['speed_smooth']:.1f} km/h", axis=1)
         ))
         
         # --- 2. 各種イベント区間の重ね描き ---
@@ -287,7 +283,7 @@ if uploaded_file is not None:
                 name=name,
                 showlegend=show_leg,
                 hoverinfo='text',
-                text=sub_seg.apply(lambda row: f"時刻(JST): {row['time_jst_str']}<br>速度: {row['speed_smooth']:.1f} km/h", axis=1)
+                text=sub_seg.apply(lambda row: f"時刻: {row['time_jst_str']}<br>速度: {row['speed_smooth']:.1f} km/h", axis=1)
             ))
             
         fig_map.update_layout(
@@ -308,7 +304,7 @@ if uploaded_file is not None:
         fig_speed = px.line(
             df, x='time', y='speed_smooth',
             title="速度推移 (km/h)",
-            labels={'speed_smooth': '速度 (km/h)', 'time': '時刻 (日本時間)'}
+            labels={'speed_smooth': '速度 (km/h)', 'time': '時刻'}
         )
         fig_speed.add_hline(y=foil_start_threshold, line_dash="dash", line_color="red", annotation_text="開始閾値")
         fig_speed.add_hline(y=foil_end_threshold, line_dash="dot", line_color="orange", annotation_text="終了閾値")
@@ -322,14 +318,13 @@ if uploaded_file is not None:
         fig_bearing = px.line(
             df, x='time', y='bearing',
             title="進行方向（方位/0-360度）",
-            labels={'bearing': '方位角 (度)', 'time': '時刻 (日本時間)'}
+            labels={'bearing': '方位角 (度)', 'time': '時刻'}
         )
         fig_bearing.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
         st.plotly_chart(fig_bearing, use_container_width=True)
 
     with st.expander("📂 解析データテーブルの表示"):
-        # 💡 下部の詳細データテーブルも日本時間文字列を表示
-        st.dataframe(df[['time_jst_str', 'speed_smooth', 'bearing', 'turn_cum', 'is_foiling', 'segment_type']].rename(columns={'time_jst_str': '時刻(日本時間)'}).head(100))
+        st.dataframe(df[['time_jst_str', 'speed_smooth', 'bearing', 'turn_cum', 'is_foiling', 'segment_type']].rename(columns={'time_jst_str': '時刻'}).head(100))
 
 else:
     st.info("👆 上記のエリアにスマートウォッチやGPSロガーから出力したGPXファイルをアップロードしてください。")
