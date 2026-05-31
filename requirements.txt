@@ -1,8 +1,6 @@
-streamlit>=1.28.0
-gpxpy>=1.6.2
-pandas>=2.0.0
-folium>=0.14.0
-streamlit-folium>=0.15.0
-numpy>=1.24.0
-haversine>=2.7.0
-matplotlib>=3.7.0
+streamlit
+gpxpy
+pandas
+numpy
+plotly
+geopy
