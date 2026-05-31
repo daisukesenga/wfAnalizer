@@ -68,8 +68,15 @@ if uploaded_file is not None:
         df = pd.DataFrame(raw_data)
         df['time'] = pd.to_datetime(df['time'])
         
+        # 💡 【日本時間（JST）へのローカライズと統一】
         if df['time'].dt.tz is not None:
             df['time'] = df['time'].dt.tz_convert('Asia/Tokyo').dt.tz_localize(None)
+        else:
+            # タイムゾーン情報がない（暗黙的にUTCである）場合は、+9時間して日本時間にする
+            df['time'] = df['time'] + pd.Timedelta(hours=9)
+            
+        # グラフ表示用に文字列フォーマットした日本時間カラムを作成
+        df['time_jst_str'] = df['time'].dt.strftime('%H:%M:%S')
         
         # 【位置データのスムージング】
         if smoothing_window > 1:
@@ -105,10 +112,8 @@ if uploaded_file is not None:
         df = df[df['speed'] < speed_max_limit].reset_index(drop=True)
         df['speed_smooth'] = df['speed'].rolling(window=smoothing_window, min_periods=1, center=True).mean()
         
-        # 4. 特徴量の計算（方位角の変化量・符号付き変化量）
-        # 💡 左右判定のために符号付きの変化量を計算
+        # 4. 特徴量の計算
         raw_bearing_diff = df['bearing'].diff()
-        # 180度をまたぐ場合の補正
         raw_bearing_diff = raw_bearing_diff.map(lambda x: x - 360 if x > 180 else (x + 360 if x < -180 else x))
         df['bearing_diff_signed'] = raw_bearing_diff
         df['bearing_diff'] = df['bearing_diff_signed'].abs()
@@ -135,7 +140,6 @@ if uploaded_file is not None:
     df['is_straight'] = df['turn_cum'] <= jibe_turn_angle_threshold
     jibe_zone = df[df['turn_cum'] > jibe_turn_angle_threshold]
     
-    # 💡 左右別のカウント用変数を定義
     right_jibe_success = 0
     right_jibe_fail = 0
     left_jibe_success = 0
@@ -143,7 +147,6 @@ if uploaded_file is not None:
     
     df['segment_type'] = 'normal'
     
-    # 【ステップ1】ジャイブ区間（成功・失敗）を確定させてロック
     if not jibe_zone.empty:
         jibe_zone = jibe_zone.copy()
         jibe_zone['group'] = (jibe_zone['time'].diff().dt.total_seconds() > 10).cumsum()
@@ -153,8 +156,6 @@ if uploaded_file is not None:
             
             if df.loc[entry_idx, 'is_foiling']:
                 min_speed_in_turn = group['speed_smooth'].min()
-                
-                # 💡 ターン中の累積角度の合計から、右回りか左回りかを判定
                 is_right_turn = group['turn_dir_cum'].sum() >= 0
                 
                 if min_speed_in_turn >= jibe_speed_threshold:
@@ -170,10 +171,9 @@ if uploaded_file is not None:
                     else:
                         left_jibe_fail += 1
                     
-    # 【ステップ2】直線フォイリング中を一時的にマーク（内部計算用）
     df.loc[(df['segment_type'] == 'normal') & (df['is_straight']) & (df['is_foiling']), 'segment_type'] = 'straight_internal'
 
-    # 【ステップ3】「直線からの沈」を検出し、その減速区間をマーク
+    # 【ステップ3】「直線からの沈」検出
     wipeout_count = 0
     wipeout_times = []
     i = 0
@@ -210,17 +210,15 @@ if uploaded_file is not None:
         else:
             i += 1
             
-    # 内部用の直線マークを通常（normal）に戻す
     df.loc[df['segment_type'] == 'straight_internal', 'segment_type'] = 'normal'
                 
-    # 💡 左右別の成功率計算
     total_right_jibes = right_jibe_success + right_jibe_fail
     right_jibe_ratio = (right_jibe_success / total_right_jibes) * 100 if total_right_jibes > 0 else 0
     
     total_left_jibes = left_jibe_success + left_jibe_fail
     left_jibe_ratio = (left_jibe_success / total_left_jibes) * 100 if total_left_jibes > 0 else 0
 
-    # --- UI表示エリア （左右に分けた4列表示） ---
+    # --- UI表示エリア ---
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("🚀 最高速度", f"{df['speed_smooth'].max():.1f} km/h")
     col2.metric("➡️ 右ターン(時計回り) 成功率", f"{right_jibe_ratio:.1f} %", f"成功:{right_jibe_success} / 全体:{total_right_jibes}")
@@ -237,13 +235,14 @@ if uploaded_file is not None:
         fig_map = go.Figure()
         
         # --- 1. ベースの通常走行軌跡（グレー） ---
+        # 💡 hoverinfoの表示テキストに日本時間（JST）を組み込みました
         fig_map.add_trace(go.Scattermapbox(
             lat=df['lat'], lon=df['lon'],
             mode='lines',
             line=dict(width=2, color='#A0AEC0'), 
             name='通常走行（直線含む）',
             hoverinfo='text',
-            text=df['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
+            text=df.apply(lambda row: f"時刻(JST): {row['time_jst_str']}<br>速度: {row['speed_smooth']:.1f} km/h", axis=1)
         ))
         
         # --- 2. 各種イベント区間の重ね描き ---
@@ -288,7 +287,7 @@ if uploaded_file is not None:
                 name=name,
                 showlegend=show_leg,
                 hoverinfo='text',
-                text=sub_seg['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
+                text=sub_seg.apply(lambda row: f"時刻(JST): {row['time_jst_str']}<br>速度: {row['speed_smooth']:.1f} km/h", axis=1)
             ))
             
         fig_map.update_layout(
@@ -309,7 +308,7 @@ if uploaded_file is not None:
         fig_speed = px.line(
             df, x='time', y='speed_smooth',
             title="速度推移 (km/h)",
-            labels={'speed_smooth': '速度 (km/h)', 'time': '時刻'}
+            labels={'speed_smooth': '速度 (km/h)', 'time': '時刻 (日本時間)'}
         )
         fig_speed.add_hline(y=foil_start_threshold, line_dash="dash", line_color="red", annotation_text="開始閾値")
         fig_speed.add_hline(y=foil_end_threshold, line_dash="dot", line_color="orange", annotation_text="終了閾値")
@@ -323,13 +322,14 @@ if uploaded_file is not None:
         fig_bearing = px.line(
             df, x='time', y='bearing',
             title="進行方向（方位/0-360度）",
-            labels={'bearing': '方位角 (度)', 'time': '時刻'}
+            labels={'bearing': '方位角 (度)', 'time': '時刻 (日本時間)'}
         )
         fig_bearing.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
         st.plotly_chart(fig_bearing, use_container_width=True)
 
     with st.expander("📂 解析データテーブルの表示"):
-        st.dataframe(df[['time', 'speed_smooth', 'bearing', 'turn_cum', 'is_foiling', 'segment_type']].head(100))
+        # 💡 下部の詳細データテーブルも日本時間文字列を表示
+        st.dataframe(df[['time_jst_str', 'speed_smooth', 'bearing', 'turn_cum', 'is_foiling', 'segment_type']].rename(columns={'time_jst_str': '時刻(日本時間)'}).head(100))
 
 else:
     st.info("👆 上記のエリアにスマートウォッチやGPSロガーから出力したGPXファイルをアップロードしてください。")
