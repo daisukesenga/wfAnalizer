@@ -9,22 +9,25 @@ from geopy.distance import geodesic
 # ページの設定
 st.set_page_config(page_title="Wing Foil GPX Analyzer", layout="wide")
 st.title("🏄‍♂️ ウィングフォイル GPXアナライザー")
-st.write("GPXファイルをアップロードして、フォイリング率、ジャイブ成功率、沈（ワイプアウト）ポイントを分析します。")
+st.write("GPXファイルをアップロードして、ジャイブ成功率や沈（ワイプアウト）ポイントを分析します。")
 
 # --- サイドバーの設定 ---
 st.sidebar.header("⚙️ 解析パラメータ設定")
-foil_threshold = st.sidebar.slider("フォイリング開始速度 (km/h)", 0.0, 20.0, 13.5, 0.5)
+foil_start_threshold = st.sidebar.slider("フォイリング開始速度 (km/h)", 0.0, 20.0, 13.5, 0.5)
+foil_end_threshold = st.sidebar.slider("フォイリング終了速度 (km/h)", 0.0, 20.0, 10.0, 0.5)
+
+if foil_end_threshold > foil_start_threshold:
+    st.sidebar.error("⚠️ 終了速度は、開始速度以下の値に設定してください。")
+
 jibe_speed_threshold = st.sidebar.slider("ジャイブ成功とみなす最低速度 (km/h)", 0.0, 20.0, 11.0, 0.5)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔄 ジャイブ（ターン）判定設定")
-jibe_turn_angle_threshold = st.sidebar.slider("直線とみなす最大角度（度）", 10, 120, 45, 5,
-                                              help="この角度以下しか曲がっていない区間を『直線（黄色）』とみなします。これを超えるとジャイブ区間になります。")
+jibe_turn_angle_threshold = st.sidebar.slider("直線とみなす最大角度（度）", 10, 120, 45, 5)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧼 スムージング（ノイズ除去）設定")
-smoothing_window = st.sidebar.slider("軌跡の平滑化強度 (データ点数)", 1, 15, 7, 1, 
-                                    help="値を大きくするとガタガタが減ります。")
+smoothing_window = st.sidebar.slider("軌跡の平滑化強度 (データ点数)", 1, 15, 7, 1)
 
 speed_max_limit = st.sidebar.number_input("GPSノイズカットの上限速度 (km/h)", 50, 100, 60)
 
@@ -107,47 +110,41 @@ if uploaded_file is not None:
         df['bearing_diff'] = df['bearing_diff'].map(lambda x: 360 - x if x > 180 else x)
         df['turn_cum'] = df['bearing_diff'].rolling(window=5, min_periods=1).sum()
 
-    # --- 分析ロジック ---
+    # --- 🏄‍♂️ フォイリング状態追跡ロジック ---
+    is_foiling_list = []
+    currently_foiling = False
     
-    # ① フォイリング率
-    foiling_df = df[df['speed_smooth'] >= foil_threshold]
-    foiling_ratio = (len(foiling_df) / len(df)) * 100 if len(df) > 0 else 0
+    for s in df['speed_smooth']:
+        if not currently_foiling:
+            if s >= foil_start_threshold:
+                currently_foiling = True
+        else:
+            if s < foil_end_threshold:
+                currently_foiling = False
+        is_foiling_list.append(currently_foiling)
+        
+    df['is_foiling'] = is_foiling_list
     
-    # ② 直線での沈（ワイプアウト）
-    df['speed_drop'] = df['speed_smooth'].diff(periods=3) * -1
-    wipeouts = df[
-        (df['speed_drop'] > 12) & 
-        (df['speed_smooth'] < 5) & 
-        (df['turn_cum'] < jibe_turn_angle_threshold)
-    ]
-    
-    # ③ ジャイブ判定と直線判定の分離
-    # 💡 ターン変化量が閾値以下の区間を「直線区間」とするフラグを作成
+    # ② 基本判定のトグル
     df['is_straight'] = df['turn_cum'] <= jibe_turn_angle_threshold
-    
     jibe_zone = df[df['turn_cum'] > jibe_turn_angle_threshold]
     
     jibe_success_count = 0
     jibe_fail_count = 0
-    valid_turn_indices = [] 
     
-    # 各データ点が成功ジャイブか失敗ジャイブかを識別するラベル初期化
     df['segment_type'] = 'normal'
     
+    # 【ステップ1】ジャイブ区間（成功・失敗）を確定させてロック
     if not jibe_zone.empty:
         jibe_zone = jibe_zone.copy()
         jibe_zone['group'] = (jibe_zone['time'].diff().dt.total_seconds() > 10).cumsum()
         
         for g_id, group in jibe_zone.groupby('group'):
             entry_idx = group.index.min()
-            entry_speed = df.loc[entry_idx, 'speed_smooth']
             
-            # フォイリング中からのターンのみ有効
-            if entry_speed >= foil_threshold:
-                valid_turn_indices.extend(group.index.tolist())
+            if df.loc[entry_idx, 'is_foiling']:
                 min_speed_in_turn = group['speed_smooth'].min()
                 
-                # 該当するインデックスの区間タイプを書き換え
                 if min_speed_in_turn >= jibe_speed_threshold:
                     jibe_success_count += 1
                     df.loc[group.index, 'segment_type'] = 'success'
@@ -155,62 +152,95 @@ if uploaded_file is not None:
                     jibe_fail_count += 1
                     df.loc[group.index, 'segment_type'] = 'fail'
                     
-    # 直線区間のラベルを上書き（ジャイブとして上書きされていない、かつフォイリング速度以上の場所）
-    df.loc[(df['is_straight']) & (df['speed_smooth'] >= foil_threshold), 'segment_type'] = 'straight'
+    # 【ステップ2】直線フォイリング中を一時的にマーク（内部計算用）
+    df.loc[(df['segment_type'] == 'normal') & (df['is_straight']) & (df['is_foiling']), 'segment_type'] = 'straight_internal'
+
+    # 【ステップ3】「直線からの沈」を検出し、その減速区間を赤線化する
+    wipeout_count = 0
+    wipeout_times = []
+    i = 0
+    n = len(df)
+    
+    while i < n - 1:
+        if df.loc[i, 'segment_type'] == 'straight_internal':
+            j = i
+            while j < n and df.loc[j, 'segment_type'] == 'straight_internal':
+                j += 1
+                
+            if j < n:
+                if df.loc[j, 'segment_type'] in ['success', 'fail']:
+                    i = j
+                    continue
+                
+                if not df.loc[j, 'is_foiling']:
+                    fall_idx = j
+                    
+                    k = fall_idx
+                    while k < n and not df.loc[k, 'is_foiling'] and df.loc[k, 'segment_type'] == 'normal':
+                        k += 1
+                        
+                    duration = (df.loc[min(k, n-1), 'time'] - df.loc[fall_idx, 'time']).total_seconds()
+                    
+                    if duration >= 10:
+                        wipeout_count += 1
+                        wipeout_times.append(df.loc[fall_idx, 'time'])
+                        # 💡 着水から完全に失速・停止するまでの区間（10秒間、または次の状態まで）を「沈区間」として赤線化
+                        end_red_idx = min(fall_idx + 10, k, n - 1)
+                        df.loc[fall_idx:end_red_idx, 'segment_type'] = 'wipeout_line'
+                    i = k
+                    continue
+            i = j
+        else:
+            i += 1
+            
+    # マップに黄色を出さないよう、内部用の直線マークを通常（normal）に戻す
+    df.loc[df['segment_type'] == 'straight_internal', 'segment_type'] = 'normal'
                 
     total_jibes = jibe_success_count + jibe_fail_count
     jibe_success_ratio = (jibe_success_count / total_jibes) * 100 if total_jibes > 0 else 0
 
-    # --- UI表示エリア ---
-    col1, col2, col3, col4 = st.columns(4)
+    # --- UI表示エリア （フォイリング率を削除し、3列に変更） ---
+    col1, col2, col3 = st.columns(3)
     col1.metric("🚀 最高速度", f"{df['speed_smooth'].max():.1f} km/h")
-    col2.metric("📊 推定フォイリング率", f"{foiling_ratio:.1f} %")
-    col3.metric("🔄 ジャイブ成功率", f"{jibe_success_ratio:.1f} %", f"成功:{jibe_success_count} / 全体:{total_jibes}")
-    col4.metric("⚠️ 直線での沈回数", f"{len(wipeouts)} 回")
+    col2.metric("🔄 ジャイブ成功率", f"{jibe_success_ratio:.1f} %", f"成功:{jibe_success_count} / 全体:{total_jibes}")
+    col3.metric("⚠️ 直線からの沈回数", f"{wipeout_count} 回")
     
     st.markdown("---")
     
     left_col, right_col = st.columns([6, 4])
     
     with left_col:
-        st.subheader("🗺️ セッションマップ（直線＝黄 / 成功＝緑 / 失敗＝赤）")
+        st.subheader("🗺️ セッションマップ（成功＝緑 / 失敗＝赤 / 直線沈＝太赤線）")
         
         fig_map = go.Figure()
         
-        # --- 1. ベースの通常・低速軌跡（グレー） ---
+        # --- 1. ベースの通常走行軌跡（グレー） ---
         fig_map.add_trace(go.Scattermapbox(
             lat=df['lat'], lon=df['lon'],
             mode='lines',
-            line=dict(width=1.5, color='#CBD5E0'), 
-            name='通常・低速走行',
-            hoverinfo='skip'
+            line=dict(width=2, color='#A0AEC0'), 
+            name='通常走行（直線含む）',
+            hoverinfo='text',
+            text=df['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
         ))
         
-        # --- 2. 状態が変わるポイントごとにグループ化して色分け描画 ---
-        # 連続する同じセグメントタイプをまとめて描画するロジック
+        # --- 2. 各種イベント区間の重ね描き ---
         df['type_block'] = (df['segment_type'] != df['segment_type'].shift()).cumsum()
         
-        straight_legend = False
         success_legend = False
         fail_legend = False
+        wipeout_legend = False
         
         for b_id, block in df.groupby('type_block'):
             seg_type = block['segment_type'].iloc[0]
             if seg_type == 'normal':
                 continue
                 
-            # 前後の繋がりを滑らかにするマージン
             start_idx = max(0, block.index.min() - 1)
             end_idx = min(len(df) - 1, block.index.max() + 1)
             sub_seg = df.loc[start_idx:end_idx]
             
-            if seg_type == 'straight':
-                color = '#F1C40F'  # 💡 直線区間：鮮やかな黄色
-                name = 'フォイリング直線区間'
-                show_leg = not straight_legend
-                straight_legend = True
-                width = 3
-            elif seg_type == 'success':
+            if seg_type == 'success':
                 color = '#2ECC71'  # ジャイブ成功：緑
                 name = 'ジャイブ成功区間'
                 show_leg = not success_legend
@@ -222,6 +252,12 @@ if uploaded_file is not None:
                 show_leg = not fail_legend
                 fail_legend = True
                 width = 5
+            elif seg_type == 'wipeout_line':
+                color = '#C0392B'  # 💡 直線からの沈：濃い赤の太線
+                name = '直線からの沈（落水減速区間）'
+                show_leg = not wipeout_legend
+                wipeout_legend = True
+                width = 5.5
                 
             fig_map.add_trace(go.Scattermapbox(
                 lat=sub_seg['lat'], lon=sub_seg['lon'],
@@ -230,16 +266,7 @@ if uploaded_file is not None:
                 name=name,
                 showlegend=show_leg,
                 hoverinfo='text',
-                text=sub_seg['speed_smooth'].map(lambda x: f"速度: {x:.1f} km/h")
-            ))
-        
-        # --- 3. 直線での沈（ワイプアウト）ポイント ---
-        if not wipeouts.empty:
-            fig_map.add_trace(go.Scattermapbox(
-                lat=wipeouts['lat'], lon=wipeouts['lon'],
-                mode='markers',
-                marker=dict(size=12, color='black', symbol='cross'),
-                name='直線での沈 (Wipeout)'
+                text=sub_seg['speed_smooth'].map(lambda x: f"沈区間 速度: {x:.1f} km/h")
             ))
             
         fig_map.update_layout(
@@ -262,7 +289,13 @@ if uploaded_file is not None:
             title="速度推移 (km/h)",
             labels={'speed_smooth': '速度 (km/h)', 'time': '時刻'}
         )
-        fig_speed.add_hline(y=foil_threshold, line_dash="dash", line_color="red", annotation_text="フォイリング閾値")
+        fig_speed.add_hline(y=foil_start_threshold, line_dash="dash", line_color="red", annotation_text="開始閾値")
+        fig_speed.add_hline(y=foil_end_threshold, line_dash="dot", line_color="orange", annotation_text="終了閾値")
+        
+        # 速度グラフ上の沈発生タイミング
+        for w_time in wipeout_times:
+            fig_speed.add_vline(x=w_time, line_color="black", line_dash="dash")
+            
         fig_speed.update_layout(height=260, margin={"r":0,"t":40,"l":0,"b":0})
         st.plotly_chart(fig_speed, use_container_width=True)
         
@@ -275,7 +308,7 @@ if uploaded_file is not None:
         st.plotly_chart(fig_bearing, use_container_width=True)
 
     with st.expander("📂 解析データテーブルの表示"):
-        st.dataframe(df[['time', 'speed_smooth', 'bearing', 'turn_cum']].head(100))
+        st.dataframe(df[['time', 'speed_smooth', 'bearing', 'turn_cum', 'is_foiling', 'segment_type']].head(100))
 
 else:
     st.info("👆 上記のエリアにスマートウォッチやGPSロガーから出力したGPXファイルをアップロードしてください。")
